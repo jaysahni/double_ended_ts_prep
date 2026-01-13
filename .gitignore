@@ -177,3 +177,6 @@ pyrightconfig.json
 
 # Pixi
 .pixi
+
+# testing files
+poly53/

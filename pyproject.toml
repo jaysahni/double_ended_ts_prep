@@ -6,14 +6,18 @@ version = "0.0.1"
 readme = "README.md"
 keywords = []
 authors = [{name = "Jay Sahni"}]
-requires-python = ">=3.14"
+requires-python = ">=3.13"
+dependencies = []
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
-rdkit = "*"
+rxnmapper = ">=0.4.2,<0.5"
+rdkit = ">=2025.9.4,<2026"
+pre-commit = ">=4.5.1,<5"
+
 
 [tool.pixi.pypi-dependencies]
 double_ended_ts_prep = { path = ".", editable = true }
@@ -38,8 +42,10 @@ pre-commit = ">=4.2"
 [tool.pixi.feature.dev.pypi-dependencies]
 ty = "*"
 
+
 [tool.ruff]
 line-length = 100
+ignore = ["D205"]
 
 [tool.ruff.lint]
 select = [
@@ -69,10 +75,11 @@ ignore = [
     "PLR0914", # Too many locals
     "PLR0915", # Too many statements
     "PLR1702", # Too many nested-blocks
+    "D205",    # Whiteline keeps disappearing
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401", "F403"]
+"__init__.py" = ["F401", "F403", "D205"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
