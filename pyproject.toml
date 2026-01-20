@@ -16,7 +16,7 @@ platforms = ["linux-64", "osx-arm64"]
 [tool.pixi.dependencies]
 rxnmapper = ">=0.4.2,<0.5"
 rdkit = ">=2025.9.4,<2026"
-pre-commit = ">=4.5.1,<5"
+pre-commit = ">=4.2"
 
 
 [tool.pixi.pypi-dependencies]
@@ -37,7 +37,7 @@ all = { depends-on = ["fmt", "lint", "types", "test"] }
 pytest = ">=8.3"
 pytest-cov = ">=6.0"
 ruff = ">=0.11"
-pre-commit = ">=4.2"
+
 
 [tool.pixi.feature.dev.pypi-dependencies]
 ty = "*"
@@ -45,7 +45,7 @@ ty = "*"
 
 [tool.ruff]
 line-length = 100
-ignore = ["D205"]
+ignore = []
 
 [tool.ruff.lint]
 select = [
@@ -79,10 +79,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401", "F403", "D205"]
+"__init__.py" = ["F401", "F403"]
 
 [tool.ruff.lint.pydocstyle]
-convention = "numpy"
+convention = "google"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "double_ended_ts_prep"]
