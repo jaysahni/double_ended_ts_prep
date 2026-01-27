@@ -104,7 +104,7 @@ def map_smirks(unmapped_smirks: str) -> str:
     return mapped_rxn
 
 
-def parse_smirks(smirks: str) -> dict[str, list[Chem.Mol] | bool | str | None]:
+def parse_smirks(smirks: str) -> dict[str, list[Chem.Mol]]:
     """Parse a SMIRKS string and return a dictionary containing RDKit molecule objects
     for reactants and products.
 
@@ -115,40 +115,32 @@ def parse_smirks(smirks: str) -> dict[str, list[Chem.Mol] | bool | str | None]:
         Dictionary with keys:
             - 'reactants': List of RDKit Mol objects
             - 'products': List of RDKit Mol objects
-            - 'valid': Boolean indicating if parsing was successful
-            - 'error': Error message if parsing failed, None otherwise
+
+    Raises:
+        ValueError: If SMIRKS contains invalid SMILES strings
 
     Examples:
         >>> result = parse_smirks("[CH3:1][OH:2]>>[CH3:1][O:2][CH3:1]")
-        >>> result['valid']
-        True
         >>> len(result['reactants'])
         1
         >>> len(result['products'])
         1
-        >>> result['error'] is None
-        True
         >>> result = parse_smirks("CCO.CC(=O)O>>CCOC(C)=O.O")
-        >>> result['valid']
-        True
         >>> len(result['reactants'])
         2
         >>> len(result['products'])
         2
-        >>> result = parse_smirks("invalid>>C")
-        >>> result['valid']
-        False
-        >>> result['error'] is not None
-        True
-        >>> "Invalid reactant SMILES" in result['error']
-        True
-        >>> result = parse_smirks("C>>invalid")
-        >>> result['valid']
-        False
-        >>> "Invalid product SMILES" in result['error']
-        True
+        >>> parse_smirks("invalid>>C")
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid reactant SMILES: invalid
+        >>> parse_smirks("C>>invalid")
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid product SMILES: invalid
     """
-    result = {"reactants": [], "products": [], "valid": False, "error": None}
+    reactants = []
+    products = []
 
     # Split SMIRKS by reaction arrow
     reactants_str, products_str, *_rest = smirks.split(">>")
@@ -162,21 +154,18 @@ def parse_smirks(smirks: str) -> dict[str, list[Chem.Mol] | bool | str | None]:
         for smiles_raw in reactants_str.split("."):
             if smiles := smiles_raw.strip():
                 if (mol := Chem.MolFromSmiles(smiles, ps)) is None:
-                    result["error"] = f"Invalid reactant SMILES: {smiles}"
-                    return result
+                    raise ValueError(f"Invalid reactant SMILES: {smiles}")
                 # Add any implicit hydrogens while preserving existing explicit ones
                 mol_with_h = Chem.AddHs(mol, addCoords=False)
-                result["reactants"].append(mol_with_h)
+                reactants.append(mol_with_h)
     # Parse products with explicit hydrogens preserved
     if products_str.strip():
         for smiles_raw in products_str.split("."):
             if smiles := smiles_raw.strip():
                 if (mol := Chem.MolFromSmiles(smiles, ps)) is None:
-                    result["error"] = f"Invalid product SMILES: {smiles}"
-                    return result
+                    raise ValueError(f"Invalid product SMILES: {smiles}")
                 # Add any implicit hydrogens while preserving existing explicit ones
                 mol_with_h = Chem.AddHs(mol, addCoords=False)
-                result["products"].append(mol_with_h)
+                products.append(mol_with_h)
 
-    result["valid"] = True
-    return result
+    return {"reactants": reactants, "products": products}
