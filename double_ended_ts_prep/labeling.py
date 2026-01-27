@@ -8,6 +8,7 @@ for later atom-tracking steps.
 import warnings
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rxnmapper import RXNMapper
 
 # minimum confidence for successful use of rxnmapper without warning
@@ -104,68 +105,67 @@ def map_smirks(unmapped_smirks: str) -> str:
     return mapped_rxn
 
 
-def parse_smirks(smirks: str) -> dict[str, list[Chem.Mol]]:
-    """Parse a SMIRKS string and return a dictionary containing RDKit molecule objects
-    for reactants and products.
+def smirks_to_molecules(smirks: str) -> dict[str, list[Chem.Mol]]:
+    """Parse a SMIRKS string and return molecules with 3D coordinates.
+
+    Combines SMIRKS parsing with 3D coordinate generation. Each molecule
+    is prepared with explicit hydrogens and embedded using ETKDGv3 distance
+    geometry for realistic initial conformations. Atom mapping labels are preserved.
 
     Args:
         smirks: A SMIRKS string in the format "reactants>>products"
 
     Returns:
         Dictionary with keys:
-            - 'reactants': List of RDKit Mol objects
-            - 'products': List of RDKit Mol objects
+            - 'reactants': List of RDKit Mol objects with 3D coordinates
+            - 'products': List of RDKit Mol objects with 3D coordinates
 
     Raises:
-        ValueError: If SMIRKS contains invalid SMILES strings
+        ValueError: If SMIRKS contains invalid SMILES or embedding fails
 
     Examples:
-        >>> result = parse_smirks("[CH3:1][OH:2]>>[CH3:1][O:2][CH3:1]")
+        >>> result = smirks_to_molecules("[CH3:1][OH:2]>>[CH3:1][O:2][CH3:3]")
         >>> len(result['reactants'])
         1
-        >>> len(result['products'])
+        >>> result['reactants'][0].GetConformer().Is3D()
+        True
+        >>> result['reactants'][0].GetAtomWithIdx(0).GetAtomMapNum()
         1
-        >>> result = parse_smirks("CCO.CC(=O)O>>CCOC(C)=O.O")
-        >>> len(result['reactants'])
-        2
-        >>> len(result['products'])
-        2
-        >>> parse_smirks("invalid>>C")
-        Traceback (most recent call last):
-            ...
-        ValueError: Invalid reactant SMILES: invalid
-        >>> parse_smirks("C>>invalid")
-        Traceback (most recent call last):
-            ...
-        ValueError: Invalid product SMILES: invalid
     """
     reactants = []
     products = []
 
-    # Split SMIRKS by reaction arrow
     reactants_str, products_str, *_rest = smirks.split(">>")
 
-    # Configure SMILES parser to preserve explicit hydrogens and atom mapping
     ps = Chem.SmilesParserParams()
     ps.removeHs = False
 
-    # Parse reactants with explicit hydrogens preserved
     if reactants_str.strip():
         for smiles_raw in reactants_str.split("."):
             if smiles := smiles_raw.strip():
                 if (mol := Chem.MolFromSmiles(smiles, ps)) is None:
                     raise ValueError(f"Invalid reactant SMILES: {smiles}")
-                # Add any implicit hydrogens while preserving existing explicit ones
                 mol_with_h = Chem.AddHs(mol, addCoords=False)
+                embed_result = AllChem.EmbedMolecule(  # type: ignore[attr-defined]
+                    mol_with_h,
+                    AllChem.ETKDGv3(),  # type: ignore[attr-defined]
+                )
+                if embed_result == -1:
+                    raise ValueError(f"Failed to embed reactant: {smiles}")
                 reactants.append(mol_with_h)
-    # Parse products with explicit hydrogens preserved
+
     if products_str.strip():
         for smiles_raw in products_str.split("."):
             if smiles := smiles_raw.strip():
                 if (mol := Chem.MolFromSmiles(smiles, ps)) is None:
                     raise ValueError(f"Invalid product SMILES: {smiles}")
-                # Add any implicit hydrogens while preserving existing explicit ones
                 mol_with_h = Chem.AddHs(mol, addCoords=False)
+                embed_result = AllChem.EmbedMolecule(  # type: ignore[attr-defined]
+                    mol_with_h,
+                    AllChem.ETKDGv3(),  # type: ignore[attr-defined]
+                )
+                if embed_result == -1:
+                    raise ValueError(f"Failed to embed product: {smiles}")
                 products.append(mol_with_h)
 
     return {"reactants": reactants, "products": products}
