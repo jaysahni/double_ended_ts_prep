@@ -462,13 +462,18 @@ def _compute_ghost_cross_energy(
     product_coords: NDArray[np.floating],
     reactant_params: NDArray[np.floating],
     product_params: NDArray[np.floating],
+    alpha_sc: float = 0.5,
 ) -> float:
     """Compute ghost cross-interaction energy between reactant and product atoms.
 
-    Computes attractive LJ (r^-6 only, no r^-12 repulsion) plus Coulomb
-    electrostatics between all reactant-product atom pairs. This allows
-    molecules to attract via dispersion and charge interactions while freely
-    overlapping without repulsive clashes.
+    Uses soft-core potentials (Beutler et al., 1994) to compute attractive LJ
+    (r^-6 only, no r^-12 repulsion) plus Coulomb electrostatics between all
+    reactant-product atom pairs. Soft-core potentials replace bare r with an
+    effective distance that remains finite at r=0, preventing the singularity
+    that occurs when molecules overlap.
+
+    Soft-core LJ:  -4 * eps * sigma^6 / (alpha_sc * sigma^6 + r^6)
+    Soft-core Coulomb:  COULOMB_K * q_ij / sqrt(alpha_sc * sigma_ij^2 + r^2)
 
     Uses Lorentz-Berthelot combining rules:
         sigma_ij = (sigma_i + sigma_j) / 2
@@ -479,26 +484,28 @@ def _compute_ghost_cross_energy(
         product_coords: (N_p, 3) coordinates in Angstroms
         reactant_params: (N_r, 3) array of [charge_e, sigma_A, epsilon_kcal]
         product_params: (N_p, 3) array of [charge_e, sigma_A, epsilon_kcal]
+        alpha_sc: Soft-core parameter controlling singularity damping (default 0.5)
 
     Returns:
         Ghost cross-interaction energy in kcal/mol
     """
     # Pairwise distance matrix: (N_r, N_p)
     diff = reactant_coords[:, None, :] - product_coords[None, :, :]
-    r = np.sqrt(np.sum(diff**2, axis=-1))
-    r = np.maximum(r, 1e-10)  # avoid division by zero
+    r_sq = np.sum(diff**2, axis=-1)
 
     # Lorentz-Berthelot combining rules
     sigma_ij = (reactant_params[:, 1, None] + product_params[None, :, 1]) / 2
     eps_ij = np.sqrt(reactant_params[:, 2, None] * product_params[None, :, 2])
 
-    # Attractive LJ only (no r^-12 repulsion): -4 * eps * (sigma/r)^6
-    sr6 = (sigma_ij / r) ** 6
-    v_disp = -4.0 * eps_ij * sr6
+    # Soft-core attractive LJ: -4 * eps * sigma^6 / (alpha_sc * sigma^6 + r^6)
+    sigma6 = sigma_ij**6
+    r6 = r_sq**3
+    v_disp = -4.0 * eps_ij * sigma6 / (alpha_sc * sigma6 + r6)
 
-    # Coulomb electrostatics
+    # Soft-core Coulomb: COULOMB_K * q_ij / sqrt(alpha_sc * sigma_ij^2 + r^2)
     q_ij = reactant_params[:, 0, None] * product_params[None, :, 0]
-    v_coul = COULOMB_K * q_ij / r
+    r_eff = np.sqrt(alpha_sc * sigma_ij**2 + r_sq)
+    v_coul = COULOMB_K * q_ij / r_eff
 
     return float(np.sum(v_disp + v_coul))
 
