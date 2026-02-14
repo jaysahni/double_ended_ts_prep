@@ -21,6 +21,8 @@ openmm = ">=8.4.0,<9"
 openff-toolkit-base = ">=0.18.0,<0.19"
 openff-interchange-base = ">=0.5.0,<0.6"
 openmmforcefields = ">=0.15.1,<0.16"
+scipy = ">=1.14"
+numpy = ">=2.0"
 
 
 [tool.pixi.pypi-dependencies]
