@@ -16,10 +16,8 @@ from double_ended_ts_prep.force_fields import (
     compute_geometric_error,
     get_atom_mapping_correspondence,
     get_molecule_coordinates,
-    prepare_molecule_from_smiles,
     set_molecule_coordinates,
 )
-
 
 # ── Coordinate extraction / setting ─────────────────────────────────────
 
@@ -57,16 +55,14 @@ class TestCoordinateRoundTrip:
 class TestApplyRigidTransform:
     """Tests for the Euler-angle rigid body transformation."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def simple_coords(self) -> np.ndarray:
         """Two-atom system along x-axis."""
         return np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
 
     def test_identity_transform(self, simple_coords: np.ndarray) -> None:
         centroid = np.mean(simple_coords, axis=0)
-        result = apply_rigid_transform(
-            simple_coords, centroid, np.zeros(3), np.zeros(3)
-        )
+        result = apply_rigid_transform(simple_coords, centroid, np.zeros(3), np.zeros(3))
         np.testing.assert_allclose(result, simple_coords, atol=1e-12)
 
     def test_pure_translation(self, simple_coords: np.ndarray) -> None:
@@ -166,7 +162,7 @@ class TestAtomMappingCorrespondence:
         mol = Chem.AddHs(mol, addCoords=False)
         from rdkit.Chem import AllChem
 
-        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())  # ty: ignore[unresolved-attribute]
         return mol
 
     def test_simple_1to1_mapping(self) -> None:

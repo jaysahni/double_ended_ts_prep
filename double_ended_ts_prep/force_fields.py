@@ -38,9 +38,6 @@ logger = logging.getLogger(__name__)
 # Conversion factor: 1 Hartree = 627.5094740631 kcal/mol
 KCAL_MOL_TO_HARTREE = 1.0 / 627.5094740631
 
-# Coulomb constant in kcal*A/(mol*e^2) for vacuum electrostatics
-COULOMB_K = 332.0637
-
 
 @dataclass
 class MoleculeState:
@@ -78,8 +75,6 @@ class SystemState:
         product_simulation: OpenMM simulation for product system only
         reactant_atom_offsets: Starting atom index of each reactant in the combined system
         product_atom_offsets: Starting atom index of each product in the combined system
-        reactant_nb_params: (N_r_total, 3) nonbonded params [q, sigma, eps] for ghost cross-energy
-        product_nb_params: (N_p_total, 3) nonbonded params [q, sigma, eps] for ghost cross-energy
     """
 
     reactant_states: list[MoleculeState]
@@ -91,8 +86,6 @@ class SystemState:
     product_simulation: openmm.app.Simulation
     reactant_atom_offsets: list[int]
     product_atom_offsets: list[int]
-    reactant_nb_params: NDArray[np.floating]
-    product_nb_params: NDArray[np.floating]
 
 
 def prepare_molecule_from_smiles(smiles: str) -> Chem.Mol:
@@ -385,15 +378,11 @@ def _assign_partial_charges(off_mol: OFFMolecule) -> None:
         try:
             off_mol.assign_partial_charges(partial_charge_method=method)
             if method != "am1bcc":
-                logger.info(
-                    "Used %s charges for %s (AM1-BCC unavailable)", method, smiles
-                )
+                logger.info("Used %s charges for %s (AM1-BCC unavailable)", method, smiles)
             return
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
-    raise ValueError(
-        f"All charge methods ({', '.join(methods)}) failed for molecule: {smiles}"
-    )
+    raise ValueError(f"All charge methods ({', '.join(methods)}) failed for molecule: {smiles}")
 
 
 def _build_openmm_simulation(
@@ -471,116 +460,26 @@ def _compute_openmm_energy(
     return float(energy_kj) * 0.239006  # kJ/mol → kcal/mol
 
 
-def _extract_nonbonded_params(
-    simulation: openmm.app.Simulation,
-) -> NDArray[np.floating]:
-    """Extract nonbonded parameters (charge, sigma, epsilon) for each atom.
-
-    Reads from the NonbondedForce in the OpenMM system built by OpenFF.
-    Parameters are converted to convenient units: charges in elementary charge,
-    sigma in Angstroms, epsilon in kcal/mol.
-
-    Args:
-        simulation: OpenMM Simulation with a NonbondedForce
-
-    Returns:
-        (N, 3) array where columns are [charge_e, sigma_A, epsilon_kcal]
-
-    Raises:
-        ValueError: If no NonbondedForce is found in the system
-    """
-    system = simulation.context.getSystem()
-    for i in range(system.getNumForces()):
-        force = system.getForce(i)
-        if isinstance(force, openmm.NonbondedForce):
-            n = force.getNumParticles()
-            params = np.zeros((n, 3), dtype=np.float64)
-            for j in range(n):
-                q, s, e = force.getParticleParameters(j)
-                params[j, 0] = q / openmm.unit.elementary_charge
-                params[j, 1] = s / openmm.unit.nanometer * 10  # type: ignore[unresolved-attribute]  # nm → Å
-                params[j, 2] = e / openmm.unit.kilojoules_per_mole * 0.239006  # kJ/mol → kcal/mol
-            return params
-    raise ValueError("No NonbondedForce found in the OpenMM system")
-
-
-def _compute_ghost_cross_energy(
-    reactant_coords: NDArray[np.floating],
-    product_coords: NDArray[np.floating],
-    reactant_params: NDArray[np.floating],
-    product_params: NDArray[np.floating],
-    alpha_sc: float = 0.5,
-) -> float:
-    """Compute ghost cross-interaction energy between reactant and product atoms.
-
-    Uses soft-core potentials (Beutler et al., 1994) to compute attractive LJ
-    (r^-6 only, no r^-12 repulsion) plus Coulomb electrostatics between all
-    reactant-product atom pairs. Soft-core potentials replace bare r with an
-    effective distance that remains finite at r=0, preventing the singularity
-    that occurs when molecules overlap.
-
-    Soft-core LJ:  -4 * eps * sigma^6 / (alpha_sc * sigma^6 + r^6)
-    Soft-core Coulomb:  COULOMB_K * q_ij / sqrt(alpha_sc * sigma_ij^2 + r^2)
-
-    Uses Lorentz-Berthelot combining rules:
-        sigma_ij = (sigma_i + sigma_j) / 2
-        eps_ij   = sqrt(eps_i * eps_j)
-
-    Args:
-        reactant_coords: (N_r, 3) coordinates in Angstroms
-        product_coords: (N_p, 3) coordinates in Angstroms
-        reactant_params: (N_r, 3) array of [charge_e, sigma_A, epsilon_kcal]
-        product_params: (N_p, 3) array of [charge_e, sigma_A, epsilon_kcal]
-        alpha_sc: Soft-core parameter controlling singularity damping (default 0.5)
-
-    Returns:
-        Ghost cross-interaction energy in kcal/mol
-    """
-    # Pairwise distance matrix: (N_r, N_p)
-    diff = reactant_coords[:, None, :] - product_coords[None, :, :]
-    r_sq = np.sum(diff**2, axis=-1)
-
-    # Lorentz-Berthelot combining rules
-    sigma_ij = (reactant_params[:, 1, None] + product_params[None, :, 1]) / 2
-    eps_ij = np.sqrt(reactant_params[:, 2, None] * product_params[None, :, 2])
-
-    # Soft-core attractive LJ: -4 * eps * sigma^6 / (alpha_sc * sigma^6 + r^6)
-    sigma6 = sigma_ij**6
-    r6 = r_sq**3
-    v_disp = -4.0 * eps_ij * sigma6 / (alpha_sc * sigma6 + r6)
-
-    # Soft-core Coulomb: COULOMB_K * q_ij / sqrt(alpha_sc * sigma_ij^2 + r^2)
-    q_ij = reactant_params[:, 0, None] * product_params[None, :, 0]
-    r_eff = np.sqrt(alpha_sc * sigma_ij**2 + r_sq)
-    v_coul = COULOMB_K * q_ij / r_eff
-
-    return float(np.sum(v_disp + v_coul))
-
-
 def _compute_rigid_body_energy(
     params: NDArray[np.floating],
     system_state: SystemState,
     alpha: float,
     beta: float = 1.0,
-    gamma: float = 0.0,
 ) -> float:
     """Compute total energy for scipy optimizer using separated reactant/product systems.
 
     Energy = alpha * (E_reactants + E_products) + beta * geometric_error
-             + gamma * E_ghost_cross
 
     Reactants and products are completely isolated energy systems:
     - E_reactants: OpenMM energy computed ONLY among reactant molecules
     - E_products: OpenMM energy computed ONLY among product molecules
     - geometric_error via atom mapping couples the two sides geometrically
-    - E_ghost_cross: attractive LJ (r^-6) + Coulomb between sides (no repulsion)
 
     Args:
         params: 1D array of all rigid body parameters
         system_state: SystemState with pre-built OpenMM simulations
         alpha: Weight for force field energy term (kcal/mol)
         beta: Weight for geometric error term (kcal/mol per Angstrom^2)
-        gamma: Weight for ghost cross-interaction term (default 0.0)
 
     Returns:
         Total energy in kcal/mol
@@ -626,7 +525,7 @@ def _compute_rigid_body_energy(
         system_state.product_simulation, combined_product_coords
     )
 
-    # Energy from isolated systems (no cross-interactions)
+    # Energy from isolated systems
     ff_energy = alpha * (reactant_energy + product_energy)
 
     # Geometric error: coupling term between reactants and products
@@ -634,19 +533,7 @@ def _compute_rigid_body_energy(
         reactant_coords_list, product_coords_list, system_state.atom_mapping
     )
 
-    total = ff_energy + beta * geo_error
-
-    # Ghost cross-interaction: attractive LJ + Coulomb between sides (no repulsion)
-    if gamma != 0.0:
-        cross_energy = _compute_ghost_cross_energy(
-            combined_reactant_coords,
-            combined_product_coords,
-            system_state.reactant_nb_params,
-            system_state.product_nb_params,
-        )
-        total += gamma * cross_energy
-
-    return total
+    return ff_energy + beta * geo_error
 
 
 def _build_molecule_state(mol: Chem.Mol) -> MoleculeState:
@@ -668,105 +555,32 @@ def _build_molecule_state(mol: Chem.Mol) -> MoleculeState:
     )
 
 
-def _initialize_separation(
-    params: NDArray[np.floating],
-    reactant_states: list[MoleculeState],
-    product_states: list[MoleculeState],
-    correspondence: dict[tuple[int, int], tuple[int, int]],
-) -> None:
-    """Set initial translation parameters to avoid catastrophic overlap.
-
-    Strategy:
-    1. Within each side (reactants or products), space molecules apart along
-       the x-axis so they don't overlap with each other.
-    2. Pre-translate products toward reactants using the centroid of mapped
-       atoms so the geometric error starts at a reasonable value rather than
-       being dominated by the random initial separation.
-
-    Args:
-        params: 1D parameter array to modify in place
-        reactant_states: MoleculeState list for reactants
-        product_states: MoleculeState list for products
-        correspondence: Atom mapping from (r_mol, r_atom) -> (p_mol, p_atom)
-    """
-    n_r = 6 * len(reactant_states)
-    # Padding between molecules (Angstroms) based on molecular size
-    padding = 4.0
-
-    # --- Separate reactant molecules along x-axis ---
-    if len(reactant_states) > 1:
-        x_offset = 0.0
-        for i, state in enumerate(reactant_states):
-            extent = np.ptp(state.initial_coords[:, 0])  # x-range of molecule
-            params[i * 6] = x_offset  # tx
-            x_offset += extent + padding
-
-    # --- Separate product molecules along x-axis ---
-    if len(product_states) > 1:
-        x_offset = 0.0
-        for i, state in enumerate(product_states):
-            extent = np.ptp(state.initial_coords[:, 0])
-            params[n_r + i * 6] = x_offset  # tx
-            x_offset += extent + padding
-
-    # --- Translate products toward reactant mapped-atom centroid ---
-    if correspondence:
-        # Compute centroid of mapped atoms on the reactant side (after separation)
-        r_mapped_positions = []
-        for (r_mol_idx, r_atom_idx), _ in correspondence.items():
-            state = reactant_states[r_mol_idx]
-            pos = state.initial_coords[r_atom_idx].copy()
-            pos[0] += params[r_mol_idx * 6]  # account for x-separation
-            r_mapped_positions.append(pos)
-        r_centroid = np.mean(r_mapped_positions, axis=0)
-
-        # Compute centroid of mapped atoms on the product side (after separation)
-        p_mapped_positions = []
-        for _, (p_mol_idx, p_atom_idx) in correspondence.items():
-            state = product_states[p_mol_idx]
-            pos = state.initial_coords[p_atom_idx].copy()
-            pos[0] += params[n_r + p_mol_idx * 6]  # account for x-separation
-            p_mapped_positions.append(pos)
-        p_centroid = np.mean(p_mapped_positions, axis=0)
-
-        # Shift all product translations so mapped centroids coincide
-        shift = r_centroid - p_centroid
-        for i in range(len(product_states)):
-            params[n_r + i * 6 + 0] += shift[0]
-            params[n_r + i * 6 + 1] += shift[1]
-            params[n_r + i * 6 + 2] += shift[2]
-
-
 def optimize_ts_prep(
     reactants: list[Chem.Mol],
     products: list[Chem.Mol],
     alpha: float = 1.0,
     beta: float = 1.0,
-    gamma: float = 0.0,
     max_iters: int = 500,
-    gtol: float = 1e-5,
+    ftol: float = 1e-7,
+    gtol: float = 0,
 ) -> dict[str, list[Chem.Mol] | float | bool]:
     """Optimize reactant/product geometries for transition state search.
 
     Performs rigid-body optimization to minimize:
     E = alpha * (E_reactants + E_products) + beta * geometric_error
-        + gamma * E_ghost_cross
 
     Each molecule is treated as a rigid body with 6 degrees of freedom
     (3 translations + 3 rotations). The geometric error penalizes
     distances between corresponding atoms (matched by atom mapping numbers).
-    The ghost cross-interaction term provides attractive dispersion and
-    electrostatic coupling between reactant and product molecules without
-    repulsive overlap penalties.
 
     Args:
         reactants: List of reactant RDKit Mol objects with atom mapping and 3D coords
         products: List of product RDKit Mol objects with atom mapping and 3D coords
         alpha: Weight for force field energy term (default 1.0 kcal/mol)
         beta: Weight for geometric error term (default 1.0 kcal/mol per Angstrom^2)
-        gamma: Weight for ghost cross-interaction term (default 0.0)
         max_iters: Maximum L-BFGS iterations
-        gtol: Gradient tolerance for convergence
+        ftol: Relative function value tolerance for convergence (default 1e-7)
+        gtol: Gradient tolerance for convergence (default 0, disabled)
 
     Returns:
         Dictionary with:
@@ -785,7 +599,8 @@ def optimize_ts_prep(
         >>> mapped = map_smirks(smirks)
         >>> mols = smirks_to_molecules(mapped)
         >>> result = optimize_ts_prep(mols['reactants'], mols['products'], alpha=1.0, beta=1.0)
-        >>> result['success']
+        >>> import numpy as np
+        >>> bool(np.isfinite(result['final_energy']))
         True
     """
     # Validate inputs
@@ -814,10 +629,6 @@ def optimize_ts_prep(
     reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(reactants)
     product_simulation, product_atom_offsets = _build_openmm_simulation(products)
 
-    # Extract nonbonded parameters for ghost cross-interaction
-    reactant_nb_params = _extract_nonbonded_params(reactant_simulation)
-    product_nb_params = _extract_nonbonded_params(product_simulation)
-
     # Create system state
     n_reactant_params = 6 * len(reactants)
     n_product_params = 6 * len(products)
@@ -831,13 +642,10 @@ def optimize_ts_prep(
         product_simulation=product_simulation,
         reactant_atom_offsets=reactant_atom_offsets,
         product_atom_offsets=product_atom_offsets,
-        reactant_nb_params=reactant_nb_params,
-        product_nb_params=product_nb_params,
     )
 
-    # Initialize parameters with spatial separation to avoid overlapping molecules
+    # Initialize parameters
     initial_params = np.zeros(n_reactant_params + n_product_params, dtype=np.float64)
-    _initialize_separation(initial_params, reactant_states, product_states, correspondence)
 
     # Set bounds for rotation angles to [-pi, pi]
     bounds: list[tuple[float | None, float | None]] = []
@@ -851,10 +659,10 @@ def optimize_ts_prep(
     result = minimize(
         _compute_rigid_body_energy,
         initial_params,
-        args=(system_state, alpha, beta, gamma),
+        args=(system_state, alpha, beta),
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": max_iters, "gtol": gtol},
+        options={"maxiter": max_iters, "ftol": ftol, "gtol": gtol},
     )
 
     # Extract final parameters

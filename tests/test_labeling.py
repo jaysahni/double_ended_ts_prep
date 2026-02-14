@@ -5,7 +5,6 @@ from __future__ import annotations
 import warnings
 
 import pytest
-from rdkit import Chem
 
 from double_ended_ts_prep.labeling import build_smirks, map_smirks, smirks_to_molecules
 
@@ -54,9 +53,9 @@ class TestMapSmirks:
             warnings.simplefilter("always")
             map_smirks(smirks)
             # Check if any warning mentions confidence
-            confidence_warnings = [x for x in w if "onfidence" in str(x.message)]
             # This may or may not warn depending on rxnmapper's confidence
             # -- we just verify the code doesn't crash
+            _ = [x for x in w if "onfidence" in str(x.message)]
 
 
 class TestSmirksToMolecules:
@@ -86,5 +85,5 @@ class TestSmirksToMolecules:
         assert 2 in map_nums
 
     def test_invalid_smiles_raises(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"Invalid|invalid|SMILES|RDKit"):
             smirks_to_molecules("INVALID>>ALSO_INVALID")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import pytest
 from rdkit import Chem
 

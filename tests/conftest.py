@@ -9,16 +9,11 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 
-import numpy as np
 import pytest
 from rdkit import Chem
 
 from double_ended_ts_prep.force_fields import (
-    _build_molecule_state,
-    _build_openmm_simulation,
-    _extract_nonbonded_params,
     get_atom_mapping_correspondence,
-    get_molecule_coordinates,
     prepare_molecule_from_smiles,
 )
 from double_ended_ts_prep.labeling import build_smirks, map_smirks, smirks_to_molecules
@@ -131,9 +126,7 @@ def proton_transfer_rxn() -> ReactionFixture:
 
     Tests charged species: AcOH + NH3 -> AcO⁻ + NH4⁺.
     """
-    return _make_reaction(
-        "Proton transfer", ["CC(=O)O", "[NH3]"], ["CC(=O)[O-]", "[NH4+]"]
-    )
+    return _make_reaction("Proton transfer", ["CC(=O)O", "[NH3]"], ["CC(=O)[O-]", "[NH4+]"])
 
 
 @pytest.fixture(scope="session")
