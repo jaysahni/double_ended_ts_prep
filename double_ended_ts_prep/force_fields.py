@@ -13,6 +13,7 @@ The TS prep workflow involves:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,8 @@ from scipy.spatial.transform import Rotation
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 # Conversion factor: 1 Hartree = 627.5094740631 kcal/mol
 KCAL_MOL_TO_HARTREE = 1.0 / 627.5094740631
@@ -366,15 +369,48 @@ def compute_geometric_error(
     return total_error
 
 
+def _assign_partial_charges(off_mol: OFFMolecule) -> None:
+    """Assign partial charges with a robust fallback chain.
+
+    Tries AM1-BCC first (gold standard for organics), then falls back to
+    Gasteiger (fast, reasonable for most organics), and finally to formal
+    charges (exact for monatomic ions, crude but finite for everything else).
+
+    Args:
+        off_mol: OpenFF Molecule to assign charges to (modified in place)
+    """
+    smiles = off_mol.to_smiles()
+    methods = ["am1bcc", "gasteiger", "formal_charge"]
+    for method in methods:
+        try:
+            off_mol.assign_partial_charges(partial_charge_method=method)
+            if method != "am1bcc":
+                logger.info(
+                    "Used %s charges for %s (AM1-BCC unavailable)", method, smiles
+                )
+            return
+        except Exception:  # noqa: BLE001
+            continue
+    raise ValueError(
+        f"All charge methods ({', '.join(methods)}) failed for molecule: {smiles}"
+    )
+
+
 def _build_openmm_simulation(
     mols: list[Chem.Mol],
 ) -> tuple[openmm.app.Simulation, list[int]]:
     """Build an OpenMM simulation from a list of RDKit molecules.
 
-    Converts RDKit molecules to OpenFF molecules, assigns AM1-BCC partial
-    charges, builds an Interchange with the OpenFF-2.2.1 force field, and
-    creates an OpenMM simulation. This is called ONCE during setup and the
-    simulation object is reused for repeated energy evaluations.
+    Converts RDKit molecules to OpenFF molecules, assigns partial charges
+    (AM1-BCC with fallback to Gasteiger/formal charges for ions), builds an
+    Interchange with the OpenFF-2.2.1 force field, and creates an OpenMM
+    simulation. This is called ONCE during setup and the simulation object
+    is reused for repeated energy evaluations.
+
+    Handles:
+    - Monatomic ions (Cl⁻, Br⁻, etc.) via formal charge fallback
+    - Molecules with undefined stereochemistry via allow_undefined_stereo
+    - Radical species are detected and raise a clear error
 
     Args:
         mols: List of RDKit Mol objects with conformers
@@ -383,7 +419,7 @@ def _build_openmm_simulation(
         Tuple of (OpenMM Simulation, list of atom offsets for each molecule)
 
     Raises:
-        ValueError: If OpenFF conversion or force field setup fails
+        ValueError: If a molecule contains radicals or force field assignment fails
     """
     forcefield = OFFForceField("openff_unconstrained-2.2.1.offxml")
     off_mols: list[OFFMolecule] = []
@@ -391,9 +427,20 @@ def _build_openmm_simulation(
     running_offset = 0
 
     for mol in mols:
+        # Check for radicals before attempting OpenFF conversion
+        smiles = Chem.MolToSmiles(mol)
+        for atom in mol.GetAtoms():
+            if atom.GetNumRadicalElectrons() > 0:
+                raise ValueError(
+                    f"Molecule '{smiles}' contains radical electrons on atom "
+                    f"{atom.GetSymbol()} (idx {atom.GetIdx()}). "
+                    f"OpenFF does not support radical species. Consider using a "
+                    f"closed-shell representation or a different force field."
+                )
+
         atom_offsets.append(running_offset)
-        off_mol = OFFMolecule.from_rdkit(mol)
-        off_mol.assign_partial_charges(partial_charge_method="am1bcc")
+        off_mol = OFFMolecule.from_rdkit(mol, allow_undefined_stereo=True)
+        _assign_partial_charges(off_mol)
         off_mols.append(off_mol)
         running_offset += mol.GetNumAtoms()
 
@@ -621,6 +668,75 @@ def _build_molecule_state(mol: Chem.Mol) -> MoleculeState:
     )
 
 
+def _initialize_separation(
+    params: NDArray[np.floating],
+    reactant_states: list[MoleculeState],
+    product_states: list[MoleculeState],
+    correspondence: dict[tuple[int, int], tuple[int, int]],
+) -> None:
+    """Set initial translation parameters to avoid catastrophic overlap.
+
+    Strategy:
+    1. Within each side (reactants or products), space molecules apart along
+       the x-axis so they don't overlap with each other.
+    2. Pre-translate products toward reactants using the centroid of mapped
+       atoms so the geometric error starts at a reasonable value rather than
+       being dominated by the random initial separation.
+
+    Args:
+        params: 1D parameter array to modify in place
+        reactant_states: MoleculeState list for reactants
+        product_states: MoleculeState list for products
+        correspondence: Atom mapping from (r_mol, r_atom) -> (p_mol, p_atom)
+    """
+    n_r = 6 * len(reactant_states)
+    # Padding between molecules (Angstroms) based on molecular size
+    padding = 4.0
+
+    # --- Separate reactant molecules along x-axis ---
+    if len(reactant_states) > 1:
+        x_offset = 0.0
+        for i, state in enumerate(reactant_states):
+            extent = np.ptp(state.initial_coords[:, 0])  # x-range of molecule
+            params[i * 6] = x_offset  # tx
+            x_offset += extent + padding
+
+    # --- Separate product molecules along x-axis ---
+    if len(product_states) > 1:
+        x_offset = 0.0
+        for i, state in enumerate(product_states):
+            extent = np.ptp(state.initial_coords[:, 0])
+            params[n_r + i * 6] = x_offset  # tx
+            x_offset += extent + padding
+
+    # --- Translate products toward reactant mapped-atom centroid ---
+    if correspondence:
+        # Compute centroid of mapped atoms on the reactant side (after separation)
+        r_mapped_positions = []
+        for (r_mol_idx, r_atom_idx), _ in correspondence.items():
+            state = reactant_states[r_mol_idx]
+            pos = state.initial_coords[r_atom_idx].copy()
+            pos[0] += params[r_mol_idx * 6]  # account for x-separation
+            r_mapped_positions.append(pos)
+        r_centroid = np.mean(r_mapped_positions, axis=0)
+
+        # Compute centroid of mapped atoms on the product side (after separation)
+        p_mapped_positions = []
+        for _, (p_mol_idx, p_atom_idx) in correspondence.items():
+            state = product_states[p_mol_idx]
+            pos = state.initial_coords[p_atom_idx].copy()
+            pos[0] += params[n_r + p_mol_idx * 6]  # account for x-separation
+            p_mapped_positions.append(pos)
+        p_centroid = np.mean(p_mapped_positions, axis=0)
+
+        # Shift all product translations so mapped centroids coincide
+        shift = r_centroid - p_centroid
+        for i in range(len(product_states)):
+            params[n_r + i * 6 + 0] += shift[0]
+            params[n_r + i * 6 + 1] += shift[1]
+            params[n_r + i * 6 + 2] += shift[2]
+
+
 def optimize_ts_prep(
     reactants: list[Chem.Mol],
     products: list[Chem.Mol],
@@ -719,8 +835,9 @@ def optimize_ts_prep(
         product_nb_params=product_nb_params,
     )
 
-    # Initialize parameters: all zeros (molecules start overlapping)
+    # Initialize parameters with spatial separation to avoid overlapping molecules
     initial_params = np.zeros(n_reactant_params + n_product_params, dtype=np.float64)
+    _initialize_separation(initial_params, reactant_states, product_states, correspondence)
 
     # Set bounds for rotation angles to [-pi, pi]
     bounds: list[tuple[float | None, float | None]] = []

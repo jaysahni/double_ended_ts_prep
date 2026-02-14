@@ -98,6 +98,53 @@ def isocyanate_hydration_rxn() -> ReactionFixture:
     return _make_reaction("Isocyanate hydration", ["N=C=O", "O"], ["NC(=O)O"])
 
 
+@pytest.fixture(scope="session")
+def cope_rxn() -> ReactionFixture:
+    """Cope rearrangement: 1:1 with undefined E/Z stereochemistry in product.
+
+    Tests that allow_undefined_stereo handling works correctly.
+    """
+    return _make_reaction("Cope", ["C=CCC(=C)C=C"], ["C=CC=CCC=C"])
+
+
+@pytest.fixture(scope="session")
+def aldol_rxn() -> ReactionFixture:
+    """Aldol condensation: 2:1 with undefined chiral center in product.
+
+    Tests that undefined chiral centers are handled correctly.
+    """
+    return _make_reaction("Aldol", ["CC=O", "CC=O"], ["CC(O)CC=O"])
+
+
+@pytest.fixture(scope="session")
+def sn2_rxn() -> ReactionFixture:
+    """SN2 with monatomic ions: CCl + Br⁻ -> CBr + Cl⁻.
+
+    Tests that monatomic ions get charges via fallback (not AM1-BCC).
+    """
+    return _make_reaction("SN2", ["CCl", "[Br-]"], ["CBr", "[Cl-]"])
+
+
+@pytest.fixture(scope="session")
+def proton_transfer_rxn() -> ReactionFixture:
+    """Proton transfer between acetic acid and ammonia.
+
+    Tests charged species: AcOH + NH3 -> AcO⁻ + NH4⁺.
+    """
+    return _make_reaction(
+        "Proton transfer", ["CC(=O)O", "[NH3]"], ["CC(=O)[O-]", "[NH4+]"]
+    )
+
+
+@pytest.fixture(scope="session")
+def amide_formation_rxn() -> ReactionFixture:
+    """Amide bond formation: 2 reactants -> 2 products.
+
+    Acetic acid + ethylamine -> N-ethylacetamide + water.
+    """
+    return _make_reaction("Amide formation", ["CC(=O)O", "NCC"], ["CC(=O)NCC", "O"])
+
+
 # ---------------------------------------------------------------------------
 # Simple molecule fixtures (no RXNMapper needed)
 # ---------------------------------------------------------------------------
