@@ -58,6 +58,11 @@ class SystemState:
         atom_mapping: Correspondence between (r_mol_idx, atom_idx) -> (p_mol_idx, atom_idx)
         n_reactant_params: Total DOFs for reactant side (6 * num_reactants)
         n_product_params: Total DOFs for product side (6 * num_products)
+        combined_reactant_mol: All reactants merged into one RDKit Mol for
+            intermolecular MMFF94 evaluation
+        combined_product_mol: All products merged into one RDKit Mol
+        reactant_atom_offsets: Starting atom index of each reactant in the combined mol
+        product_atom_offsets: Starting atom index of each product in the combined mol
     """
 
     reactant_states: list[MoleculeState]
@@ -65,6 +70,10 @@ class SystemState:
     atom_mapping: dict[tuple[int, int], tuple[int, int]]
     n_reactant_params: int
     n_product_params: int
+    combined_reactant_mol: Chem.Mol
+    combined_product_mol: Chem.Mol
+    reactant_atom_offsets: list[int]
+    product_atom_offsets: list[int]
 
 
 def prepare_molecule_from_smiles(smiles: str) -> Chem.Mol:
@@ -342,18 +351,26 @@ def compute_geometric_error(
 
 
 def _compute_rigid_body_energy(
-    params: NDArray[np.floating],
-    system_state: SystemState,
-    alpha: float,
+    params: NDArray[np.floating], system_state: SystemState, alpha: float, beta: float = 1.0
 ) -> float:
-    """Compute total energy for scipy optimizer.
+    """Compute total energy for scipy optimizer using separated reactant/product systems.
 
-    Energy = E_reactants(coords) + E_products(coords) + alpha * geometric_error
+    Energy = alpha * (E_reactants + E_products) + beta * geometric_error
+
+    Where E_reactants and E_products are computed separately:
+    - E_reactants captures interactions ONLY among reactant molecules
+    - E_products captures interactions ONLY among product molecules
+    - NO cross-interactions between reactants and products are included
+
+    This separation is achieved by combining all reactant molecules into one
+    RDKit molecule (for MMFF94 evaluation) and all product molecules into another,
+    then computing their energies independently.
 
     Args:
         params: 1D array of all rigid body parameters
-        system_state: SystemState containing molecule info
-        alpha: Weight for geometric error term (kcal/mol per Angstrom^2)
+        system_state: SystemState containing molecule info with combined_*_mol
+        alpha: Weight for force field energy term (kcal/mol)
+        beta: Weight for geometric error term (kcal/mol per Angstrom^2)
 
     Returns:
         Total energy in kcal/mol
@@ -363,38 +380,63 @@ def _compute_rigid_body_energy(
     reactant_params = params[:n_r].reshape(-1, 6)
     product_params = params[n_r:].reshape(-1, 6)
 
-    total_energy = 0.0
-
-    # Process reactants
+    # === REACTANT SYSTEM: Interactions ONLY among reactant molecules ===
+    # Transform individual reactant molecules and accumulate coordinates into combined array
     reactant_coords_list: list[NDArray[np.floating]] = []
+    combined_reactant_coords = np.zeros_like(
+        get_molecule_coordinates(system_state.combined_reactant_mol)
+    )
+
     for i, state in enumerate(system_state.reactant_states):
         trans = reactant_params[i, :3]
         rot = reactant_params[i, 3:]
         new_coords = apply_rigid_transform(state.initial_coords, state.centroid, trans, rot)
         reactant_coords_list.append(new_coords)
 
-        # Update mol copy and compute energy
-        mol_copy = Chem.RWMol(state.mol)
-        set_molecule_coordinates(mol_copy, new_coords)
-        total_energy += compute_mmff_energy(mol_copy.GetMol())
+        # Copy transformed coordinates into combined reactant array at appropriate offset
+        # This preserves spatial relationships for MMFF94 to compute intra-reactant interactions
+        offset = system_state.reactant_atom_offsets[i]
+        atom_count = state.atom_count
+        combined_reactant_coords[offset : offset + atom_count] = new_coords
 
-    # Process products
+    # Update combined reactant molecule with all transformed reactant coordinates
+    # MMFF94 will compute interactions ONLY among atoms in the reactant system
+    set_molecule_coordinates(system_state.combined_reactant_mol, combined_reactant_coords)
+    reactant_energy = compute_mmff_energy(system_state.combined_reactant_mol)
+
+    # === PRODUCT SYSTEM: Interactions ONLY among product molecules ===
+    # Transform individual product molecules and accumulate coordinates into combined array
     product_coords_list: list[NDArray[np.floating]] = []
+    combined_product_coords = np.zeros_like(
+        get_molecule_coordinates(system_state.combined_product_mol)
+    )
+
     for i, state in enumerate(system_state.product_states):
         trans = product_params[i, :3]
         rot = product_params[i, 3:]
         new_coords = apply_rigid_transform(state.initial_coords, state.centroid, trans, rot)
         product_coords_list.append(new_coords)
 
-        mol_copy = Chem.RWMol(state.mol)
-        set_molecule_coordinates(mol_copy, new_coords)
-        total_energy += compute_mmff_energy(mol_copy.GetMol())
+        # Copy transformed coordinates into combined product array at appropriate offset
+        # This preserves spatial relationships for MMFF94 to compute intra-product interactions
+        offset = system_state.product_atom_offsets[i]
+        atom_count = state.atom_count
+        combined_product_coords[offset : offset + atom_count] = new_coords
 
-    # Add geometric error penalty
+    # Update combined product molecule with all transformed product coordinates
+    # MMFF94 will compute interactions ONLY among atoms in the product system
+    set_molecule_coordinates(system_state.combined_product_mol, combined_product_coords)
+    product_energy = compute_mmff_energy(system_state.combined_product_mol)
+
+    # Sum energy from isolated systems: no cross-interactions between reactants and products
+    ff_energy = alpha * (reactant_energy + product_energy)
+
+    # Add geometric error penalty: penalizes distances between mapped atom pairs
+    # (only used to guide geometry, no energy interaction between the systems)
     geo_error = compute_geometric_error(
         reactant_coords_list, product_coords_list, system_state.atom_mapping
     )
-    total_energy += alpha * geo_error
+    total_energy = ff_energy + beta * geo_error
 
     return total_energy
 
@@ -418,10 +460,79 @@ def _build_molecule_state(mol: Chem.Mol) -> MoleculeState:
     )
 
 
+def _build_combined_molecule(mols: list[Chem.Mol]) -> tuple[Chem.Mol, list[int]]:
+    """Combine multiple RDKit molecules into a single molecule.
+
+    Merges all input molecules into one while preserving atom order and coordinates.
+    This allows MMFF94 to compute interactions ONLY within this group.
+
+    When called separately for reactants and products, this creates two isolated
+    systems where:
+    - Reactant combined molecule: allows intra-reactant interactions
+    - Product combined molecule: allows intra-product interactions
+    - NO cross-interactions between the two systems
+
+    Args:
+        mols: List of RDKit Mol objects with conformers to combine
+
+    Returns:
+        Tuple of:
+            - Combined RDKit Mol with all input atoms and a single conformer
+            - List of atom offsets: starting atom index for each input molecule
+              in the combined molecule (used to map transformed coords back)
+
+    Raises:
+        ValueError: If any molecule lacks a conformer
+    """
+    combined = Chem.RWMol()
+    atom_offsets: list[int] = []
+    all_coords: list[NDArray[np.floating]] = []
+
+    for mol in mols:
+        if mol.GetNumConformers() == 0:
+            raise ValueError("Cannot combine molecules: one or more lacks a conformer")
+
+        atom_offset = combined.GetNumAtoms()
+        atom_offsets.append(atom_offset)
+        coords = get_molecule_coordinates(mol)
+        all_coords.append(coords)
+
+        # Add all atoms from this molecule
+        for atom in mol.GetAtoms():
+            combined.AddAtom(Chem.Atom(atom))
+
+        # Add all bonds from this molecule with adjusted atom indices
+        for bond in mol.GetBonds():
+            begin_idx = bond.GetBeginAtomIdx() + atom_offset
+            end_idx = bond.GetEndAtomIdx() + atom_offset
+            combined.AddBond(begin_idx, end_idx, bond.GetBondType())
+
+    # Create conformer and set coordinates
+    combined_mol = combined.GetMol()
+
+    # Sanitize to ensure implicit valences and other properties are properly set
+    Chem.SanitizeMol(combined_mol)
+
+    conf = Chem.Conformer(combined_mol.GetNumAtoms())
+
+    coord_idx = 0
+    for mol_coords in all_coords:
+        for coord in mol_coords:
+            conf.SetAtomPosition(
+                coord_idx, Point3D(float(coord[0]), float(coord[1]), float(coord[2]))
+            )
+            coord_idx += 1
+
+    combined_mol.AddConformer(conf, assignId=True)
+
+    return combined_mol, atom_offsets
+
+
 def optimize_ts_prep(
     reactants: list[Chem.Mol],
     products: list[Chem.Mol],
     alpha: float = 1.0,
+    beta: float = 1.0,
     initial_separation: float = 10.0,
     max_iters: int = 500,
     gtol: float = 1e-5,
@@ -429,7 +540,7 @@ def optimize_ts_prep(
     """Optimize reactant/product geometries for transition state search.
 
     Performs rigid-body optimization to minimize:
-    E = MMFF_reactants + MMFF_products + alpha * geometric_error
+    E = alpha * (E_reactants + E_products) + beta * geometric_error
 
     Each molecule is treated as a rigid body with 6 degrees of freedom
     (3 translations + 3 rotations). The geometric error penalizes
@@ -438,8 +549,11 @@ def optimize_ts_prep(
     Args:
         reactants: List of reactant RDKit Mol objects with atom mapping and 3D coords
         products: List of product RDKit Mol objects with atom mapping and 3D coords
-        alpha: Weight for geometric error term (default 1.0 kcal/mol/Angstrom^2)
+        alpha: Weight for force field energy term (default 1.0 kcal/mol)
+        beta: Weight for geometric error term (default 1.0 kcal/mol per Angstrom^2)
         initial_separation: Initial x-separation between reactants and products (Angstroms)
+        max_iters: Maximum L-BFGS iterations
+        gtol: Gradient tolerance for convergence
         max_iters: Maximum L-BFGS iterations
         gtol: Gradient tolerance for convergence
 
@@ -459,7 +573,7 @@ def optimize_ts_prep(
         >>> smirks = build_smirks(["N=C=O", "O"], ["NC(=O)O"])
         >>> mapped = map_smirks(smirks)
         >>> mols = smirks_to_molecules(mapped)
-        >>> result = optimize_ts_prep(mols['reactants'], mols['products'], alpha=1.0)
+        >>> result = optimize_ts_prep(mols['reactants'], mols['products'], alpha=1.0, beta=1.0)
         >>> result['success']
         True
     """
@@ -485,6 +599,10 @@ def optimize_ts_prep(
     reactant_states = [_build_molecule_state(mol) for mol in reactants]
     product_states = [_build_molecule_state(mol) for mol in products]
 
+    # Build combined molecules for system energy evaluation
+    combined_reactant_mol, reactant_atom_offsets = _build_combined_molecule(reactants)
+    combined_product_mol, product_atom_offsets = _build_combined_molecule(products)
+
     # Create system state
     n_reactant_params = 6 * len(reactants)
     n_product_params = 6 * len(products)
@@ -494,6 +612,10 @@ def optimize_ts_prep(
         atom_mapping=correspondence,
         n_reactant_params=n_reactant_params,
         n_product_params=n_product_params,
+        combined_reactant_mol=combined_reactant_mol,
+        combined_product_mol=combined_product_mol,
+        reactant_atom_offsets=reactant_atom_offsets,
+        product_atom_offsets=product_atom_offsets,
     )
 
     # Initialize parameters: zeros for reactants, x-translation for products
@@ -516,7 +638,7 @@ def optimize_ts_prep(
     result = minimize(
         _compute_rigid_body_energy,
         initial_params,
-        args=(system_state, alpha),
+        args=(system_state, alpha, beta),
         method="L-BFGS-B",
         bounds=bounds,
         options={"maxiter": max_iters, "gtol": gtol},
