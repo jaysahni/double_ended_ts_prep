@@ -114,8 +114,9 @@ E = alpha * (E_reactants + E_products) + beta * geometric_error
 | `reactants` | `list[Chem.Mol]` | required | Reactant molecules with atom mapping and 3D coords |
 | `products` | `list[Chem.Mol]` | required | Product molecules with atom mapping and 3D coords |
 | `alpha` | `float` | `1.0` | Weight for intramolecular force field energy (kcal/mol) |
-| `beta` | `float` | `1.0` | Weight for geometric alignment penalty (kcal/mol per A^2) |
+| `beta` | `float` | `5.0` | Weight for geometric alignment penalty (kcal/mol per A^2) |
 | `max_iters` | `int` | `500` | Maximum L-BFGS-B iterations |
+| `ftol` | `float` | `1e-12` | Relative function value tolerance for convergence |
 | `gtol` | `float` | `1e-5` | Gradient tolerance for convergence |
 
 **Returns:** Dictionary with keys `reactants`, `products` (optimized `Mol` objects), `final_energy`, `geometric_error`, and `success`.
@@ -127,6 +128,55 @@ Exports molecules to XYZ files under `output_dir/reactants/` and `output_dir/pro
 #### `prepare_molecule_from_smiles(smiles) -> Chem.Mol`
 
 Standalone utility to create a 3D-embedded RDKit molecule from a SMILES string.
+
+## CLI Usage
+
+The `scripts/run_ts_prep.py` script provides a command-line interface for running the full pipeline without writing Python code.
+
+### XYZ Mode (default)
+
+Reads 3D coordinates directly from XYZ files, preserving the input geometry. SMILES are extracted from the comment line for atom mapping. Per-atom charges from an optional 5th column are used directly; otherwise Gasteiger charges are computed.
+
+```bash
+# Use default files (reactants.xyz, product.xyz)
+pixi run python scripts/run_ts_prep.py
+
+# Specify files explicitly
+pixi run python scripts/run_ts_prep.py --reactants reactants.xyz --products product.xyz
+```
+
+XYZ files must include a `smiles:` field in the comment line (line 2). Multi-molecule systems use dot-separated SMILES (e.g., `smiles: MOL1.MOL2`). See [METHODOLOGY.md](METHODOLOGY.md) for format details.
+
+### SMILES Mode
+
+Provide reactant/product SMILES directly (3D coordinates are generated via ETKDGv3, charges via Gasteiger):
+
+```bash
+pixi run python scripts/run_ts_prep.py --smiles \
+    --reactants "CCCCCCN=C=O" "CCCCCCO" \
+    --products "CCCCCCNC(=O)OCCCCCC"
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--smiles` | off | SMILES input mode (instead of XYZ files) |
+| `--reactants` | `reactants.xyz` | XYZ filename(s) or SMILES string(s) |
+| `--products` | `product.xyz` | XYZ filename(s) or SMILES string(s) |
+| `--name NAME` | none | Base name for output: `{name}_reactants.xyz`, `{name}_products.xyz` |
+| `--output-dir` | `molecules/output/` | Output directory |
+| `--overwrite` | off | Overwrite existing output files (default: append `_1`, `_2`, etc.) |
+| `--alpha` | `1.0` | Force field energy weight |
+| `--beta` | `1.0` | Geometric error weight |
+| `--max-iters` | `500` | Maximum L-BFGS-B iterations |
+| `--gtol` | `1e-5` | Gradient tolerance for convergence |
+
+### Output
+
+The script writes two XYZ files with matched atom indexing -- mapped atoms appear at the same line index in both files, sorted by atom mapping number. The comment line contains metadata including pure force field energy (without geometric penalty), SMILES, and a timestamp.
+
+The summary prints timing for each phase (atom labeling, simulation setup, optimization) and a breakdown of FF energy, geometric error, and total objective.
 
 ## Tuning the Energy Weights
 

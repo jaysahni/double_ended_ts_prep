@@ -24,8 +24,9 @@ import openmm.app
 from openff.interchange import Interchange
 from openff.toolkit import ForceField as OFFForceField
 from openff.toolkit import Molecule as OFFMolecule
+from openff.units import unit as off_unit
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdDetermineBonds
 from rdkit.Geometry import Point3D
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
@@ -86,6 +87,25 @@ class SystemState:
     product_simulation: openmm.app.Simulation
     reactant_atom_offsets: list[int]
     product_atom_offsets: list[int]
+
+
+@dataclass
+class XYZData:
+    """Parsed contents of a multi-molecule XYZ file.
+
+    Attributes:
+        n_atoms: Total number of atoms in the file
+        metadata: Comment-line metadata (same format as parse_xyz_metadata)
+        elements: Element symbols, length n_atoms
+        coords: Atomic coordinates in Angstroms, shape (n_atoms, 3)
+        charges: Per-atom partial charges from 5th column, or None if absent
+    """
+
+    n_atoms: int
+    metadata: dict[str, str | list[str]]
+    elements: list[str]
+    coords: NDArray[np.floating]
+    charges: list[float] | None
 
 
 def prepare_molecule_from_smiles(smiles: str) -> Chem.Mol:
@@ -327,6 +347,27 @@ def compute_mmff_energy(mol: Chem.Mol) -> float:
     return ff.CalcEnergy()
 
 
+def optimize_molecule_geometry(mol: Chem.Mol, max_iters: int = 200) -> None:
+    """Optimize a molecule's 3D geometry using MMFF94 (UFF fallback).
+
+    Minimizes internal coordinates so each molecule is at a classical
+    force-field energy minimum before rigid-body optimization.  The
+    molecule is modified in place.
+
+    Args:
+        mol: RDKit Mol with a conformer (modified in place).
+        max_iters: Maximum minimization iterations.
+    """
+    mmff_props = AllChem.MMFFGetMoleculeProperties(mol)  # type: ignore[attr-defined]
+    if mmff_props is not None:
+        ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props)  # type: ignore[attr-defined]
+        if ff is not None:
+            ff.Minimize(maxIts=max_iters)
+            return
+    # Fallback to UFF
+    AllChem.UFFOptimizeMolecule(mol, maxIters=max_iters)  # type: ignore[attr-defined]
+
+
 def compute_geometric_error(
     reactant_coords_list: list[NDArray[np.floating]],
     product_coords_list: list[NDArray[np.floating]],
@@ -387,35 +428,36 @@ def _assign_partial_charges(off_mol: OFFMolecule) -> None:
 
 def _build_openmm_simulation(
     mols: list[Chem.Mol],
+    preset_charges: list[list[float]] | None = None,
 ) -> tuple[openmm.app.Simulation, list[int]]:
     """Build an OpenMM simulation from a list of RDKit molecules.
 
-    Converts RDKit molecules to OpenFF molecules, assigns partial charges
-    (AM1-BCC with fallback to Gasteiger/formal charges for ions), builds an
-    Interchange with the OpenFF-2.2.1 force field, and creates an OpenMM
-    simulation. This is called ONCE during setup and the simulation object
-    is reused for repeated energy evaluations.
-
-    Handles:
-    - Monatomic ions (Cl⁻, Br⁻, etc.) via formal charge fallback
-    - Molecules with undefined stereochemistry via allow_undefined_stereo
-    - Radical species are detected and raise a clear error
+    Converts RDKit molecules to OpenFF molecules, assigns partial charges,
+    builds an Interchange with the OpenFF-2.2.1 force field, and creates an
+    OpenMM simulation.  This is called ONCE during setup and the simulation
+    object is reused for repeated energy evaluations.
 
     Args:
-        mols: List of RDKit Mol objects with conformers
+        mols: List of RDKit Mol objects with conformers.
+        preset_charges: Optional list of per-molecule charge lists. When
+            provided, these charges are used directly (skipping Gasteiger).
+            Each inner list has length equal to the molecule's atom count,
+            in elementary charge units.  When ``None``, Gasteiger charges
+            are computed.
 
     Returns:
-        Tuple of (OpenMM Simulation, list of atom offsets for each molecule)
+        Tuple of (OpenMM Simulation, list of atom offsets for each molecule).
 
     Raises:
-        ValueError: If a molecule contains radicals or force field assignment fails
+        ValueError: If a molecule contains radicals or force field assignment
+            fails.
     """
     forcefield = OFFForceField("openff_unconstrained-2.2.1.offxml")
     off_mols: list[OFFMolecule] = []
     atom_offsets: list[int] = []
     running_offset = 0
 
-    for mol in mols:
+    for i, mol in enumerate(mols):
         # Check for radicals before attempting OpenFF conversion
         smiles = Chem.MolToSmiles(mol)
         for atom in mol.GetAtoms():
@@ -429,7 +471,13 @@ def _build_openmm_simulation(
 
         atom_offsets.append(running_offset)
         off_mol = OFFMolecule.from_rdkit(mol, allow_undefined_stereo=True)
-        _assign_partial_charges(off_mol)
+
+        if preset_charges is not None and preset_charges[i] is not None:
+            charges_array = np.array(preset_charges[i]) * off_unit.elementary_charge
+            off_mol.partial_charges = charges_array
+        else:
+            off_mol.assign_partial_charges(partial_charge_method="gasteiger")
+
         off_mols.append(off_mol)
         running_offset += mol.GetNumAtoms()
 
@@ -562,7 +610,9 @@ def optimize_ts_prep(
     beta: float = 5.0,
     max_iters: int = 500,
     ftol: float = 1e-12,
-    gtol: float = 0,
+    gtol: float = 1e-5,
+    reactant_charges: list[list[float]] | None = None,
+    product_charges: list[list[float]] | None = None,
 ) -> dict[str, list[Chem.Mol] | float | bool]:
     """Optimize reactant/product geometries for transition state search.
 
@@ -579,8 +629,12 @@ def optimize_ts_prep(
         alpha: Weight for force field energy term (default 1.0 kcal/mol)
         beta: Weight for geometric error term (default 1.0 kcal/mol per Angstrom^2)
         max_iters: Maximum L-BFGS iterations
-        ftol: Relative function value tolerance for convergence (default 1e-7)
-        gtol: Gradient tolerance for convergence (default 0, disabled)
+        ftol: Relative function value tolerance for convergence (default 1e-12)
+        gtol: Gradient tolerance for convergence (default 1e-5)
+        reactant_charges: Optional per-molecule charge lists for reactants.
+            Each inner list has per-atom partial charges in elementary charge
+            units.  When provided, skips Gasteiger computation for reactants.
+        product_charges: Same as *reactant_charges* but for products.
 
     Returns:
         Dictionary with:
@@ -626,8 +680,14 @@ def optimize_ts_prep(
     product_states = [_build_molecule_state(mol) for mol in products]
 
     # Build OpenMM simulations for each side (done ONCE, reused in optimization loop)
-    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(reactants)
-    product_simulation, product_atom_offsets = _build_openmm_simulation(products)
+    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(
+        reactants,
+        preset_charges=reactant_charges,
+    )
+    product_simulation, product_atom_offsets = _build_openmm_simulation(
+        products,
+        preset_charges=product_charges,
+    )
 
     # Create system state
     n_reactant_params = 6 * len(reactants)
@@ -760,6 +820,182 @@ def parse_xyz_metadata(path: str | Path) -> list[str]:
         raise ValueError(f"XYZ file {path} comment line has no 'smiles' field")
 
     return metadata["smiles"].split(".")
+
+
+def parse_xyz_file(path: str | Path) -> XYZData:
+    """Parse a complete XYZ file including coordinates and optional charges.
+
+    Reads atom count (line 0), metadata from comment line (line 1), and all
+    coordinate lines.  If every atom line has a 5th column, it is interpreted
+    as a per-atom partial charge.
+
+    Args:
+        path: Path to the XYZ file.
+
+    Returns:
+        XYZData with elements, coordinates, and optional charges.
+
+    Raises:
+        ValueError: If the file format is invalid or atom count mismatches.
+    """
+    path = Path(path)
+    lines = path.read_text().splitlines()
+
+    n_atoms = int(lines[0].strip())
+    if len(lines) < 2 + n_atoms:
+        raise ValueError(
+            f"XYZ file {path} claims {n_atoms} atoms but has only {len(lines) - 2} coordinate lines"
+        )
+
+    # Parse comment line for metadata (reuse logic from parse_xyz_metadata)
+    comment = lines[1]
+    metadata: dict[str, str | list[str]] = {}
+    for raw_token in comment.split(";"):
+        stripped = raw_token.strip()
+        if not stripped or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", maxsplit=1)
+        key = key.strip().lower()
+        value_str = value.strip()
+        if key == "smiles":
+            metadata[key] = value_str.split(".")
+        else:
+            metadata[key] = value_str
+
+    if "smiles" not in metadata:
+        raise ValueError(f"XYZ file {path} comment line has no 'smiles' field")
+
+    elements: list[str] = []
+    coords_list: list[list[float]] = []
+    charges: list[float] = []
+    has_charges: bool | None = None
+
+    for i in range(n_atoms):
+        tokens = lines[2 + i].split()
+        if len(tokens) < 4:  # noqa: PLR2004
+            raise ValueError(f"Line {2 + i} has fewer than 4 columns in {path}")
+
+        elements.append(tokens[0])
+        coords_list.append([float(tokens[1]), float(tokens[2]), float(tokens[3])])
+
+        line_has_charge = len(tokens) >= 5  # noqa: PLR2004
+        if has_charges is None:
+            has_charges = line_has_charge
+        elif has_charges != line_has_charge:
+            raise ValueError(
+                f"Inconsistent column count in {path}: line {2 + i} "
+                f"{'has' if line_has_charge else 'lacks'} a 5th column"
+            )
+
+        if line_has_charge:
+            charges.append(float(tokens[4]))
+
+    return XYZData(
+        n_atoms=n_atoms,
+        metadata=metadata,
+        elements=elements,
+        coords=np.array(coords_list, dtype=np.float64),
+        charges=charges if has_charges else None,
+    )
+
+
+def split_xyz_by_molecules(
+    xyz_data: XYZData,
+    smiles_list: list[str],
+) -> list[dict]:
+    """Split concatenated XYZ data into per-molecule chunks.
+
+    Uses the atom count (with explicit H) from each SMILES to determine
+    molecule boundaries in the concatenated coordinate block.
+
+    Args:
+        xyz_data: Parsed XYZ data (all atoms concatenated).
+        smiles_list: SMILES strings, one per molecule in concatenation order.
+
+    Returns:
+        List of dicts per molecule with keys ``'smiles'``, ``'elements'``,
+        ``'coords'`` (N_i, 3), and ``'charges'`` (list[float] | None).
+
+    Raises:
+        ValueError: If atom counts do not sum to the total.
+    """
+    expected_counts: list[int] = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES in XYZ comment: {smi}")
+        mol_h = Chem.AddHs(mol)
+        expected_counts.append(mol_h.GetNumAtoms())
+
+    if sum(expected_counts) != xyz_data.n_atoms:
+        raise ValueError(
+            f"SMILES imply {sum(expected_counts)} atoms but XYZ has {xyz_data.n_atoms}"
+        )
+
+    result: list[dict] = []
+    offset = 0
+    for smi, count in zip(smiles_list, expected_counts, strict=True):
+        chunk: dict = {
+            "smiles": smi,
+            "elements": xyz_data.elements[offset : offset + count],
+            "coords": xyz_data.coords[offset : offset + count],
+            "charges": (
+                xyz_data.charges[offset : offset + count] if xyz_data.charges is not None else None
+            ),
+        }
+        result.append(chunk)
+        offset += count
+
+    return result
+
+
+def mol_from_xyz_block(
+    elements: list[str],
+    coords: NDArray[np.floating],
+    smiles: str,
+) -> Chem.Mol:
+    """Build an RDKit molecule from XYZ data using SMILES as bond-order template.
+
+    Creates a raw molecule from element symbols and coordinates, then applies
+    bond orders from the SMILES-derived template via
+    ``AllChem.AssignBondOrdersFromTemplate``.  The returned molecule preserves
+    the original XYZ atom ordering.
+
+    Args:
+        elements: Element symbols (length N).
+        coords: (N, 3) coordinates in Angstroms.
+        smiles: SMILES string for this molecule (bond-order source).
+
+    Returns:
+        RDKit Mol with correct bond orders, explicit Hs, and XYZ coordinates.
+
+    Raises:
+        ValueError: If template matching fails.
+    """
+    n = len(elements)
+    xyz_block = f"{n}\n\n"
+    for elem, (x, y, z) in zip(elements, coords, strict=True):
+        xyz_block += f"{elem} {x:.8f} {y:.8f} {z:.8f}\n"
+
+    raw_mol = Chem.MolFromXYZBlock(xyz_block)
+    if raw_mol is None:
+        raise ValueError("RDKit failed to parse XYZ block")
+
+    # MolFromXYZBlock creates atoms without bonds; determine connectivity
+    # from interatomic distances before template matching.
+    rdDetermineBonds.DetermineConnectivity(raw_mol)
+
+    template = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    if template is None:
+        raise ValueError(f"Invalid template SMILES: {smiles}")
+
+    mol = AllChem.AssignBondOrdersFromTemplate(template, raw_mol)
+
+    # The returned molecule needs full sanitization (ring info, valence
+    # calculation, aromaticity) for downstream code (MMFF, OpenFF, etc.).
+    Chem.SanitizeMol(mol)
+
+    return mol
 
 
 def mol_to_xyz_string(mol: Chem.Mol, comment: str = "") -> str:

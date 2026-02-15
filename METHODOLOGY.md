@@ -13,6 +13,8 @@ This is formulated as a rigid-body optimization problem where each molecule can 
 
 ## Pipeline
 
+The package supports two input modes: **SMILES mode** (generates coordinates from scratch) and **XYZ mode** (uses pre-computed coordinates and optional charges). Both modes share the same atom mapping and optimization steps.
+
 ### Step 1: Reaction Definition and Atom Mapping
 
 The process begins with reactant and product SMILES strings. These are combined into a SMIRKS reaction string using `build_smirks()`:
@@ -29,7 +31,9 @@ The unmapped SMIRKS is then passed to `map_smirks()`, which uses [RXNMapper](htt
 
 The confidence score is checked against a minimum threshold (0.7); low-confidence mappings trigger a warning since incorrect atom correspondence will lead to poor optimization results.
 
-### Step 2: 3D Coordinate Generation
+RXNMapper only maps heavy atoms. Hydrogen atoms retain mapping number 0 throughout the pipeline. This is consistent with `get_atom_mapping_correspondence()`, which only tracks atoms with nonzero mapping numbers.
+
+### Step 2a: 3D Coordinate Generation (SMILES Mode)
 
 `smirks_to_molecules()` parses the mapped SMIRKS and generates 3D coordinates for each molecule:
 
@@ -39,6 +43,68 @@ The confidence score is checked against a minimum threshold (0.7); low-confidenc
 
 At this stage, each molecule has valid 3D coordinates but the molecules are not spatially related to each other.
 
+### Step 2b: Coordinate and Charge Loading (XYZ Mode)
+
+In XYZ mode, 3D coordinates come directly from input XYZ files rather than being generated from SMILES. This preserves pre-optimized geometries (e.g., from DFT calculations).
+
+#### XYZ File Format
+
+```
+<atom_count>
+charge: 0; multiplicity: 1; smiles: MOL1.MOL2; ...
+<element> <x> <y> <z> [<charge>]
+<element> <x> <y> <z> [<charge>]
+...
+```
+
+- **Line 1:** Total atom count across all molecules
+- **Line 2:** Semicolon-delimited metadata. Must include a `smiles:` field with dot-separated SMILES for each molecule in the file
+- **Lines 3+:** Atom coordinates. An optional 5th column provides per-atom partial charges
+
+Multi-molecule files list atoms contiguously: all atoms of molecule 1, then all atoms of molecule 2, etc. The order must match the dot-separated SMILES order.
+
+#### Molecule Construction from XYZ
+
+Building RDKit molecules from XYZ data requires reconstructing bond orders, since XYZ files only store coordinates and elements. This is handled by `mol_from_xyz_block()`:
+
+1. **Parse XYZ block** via `Chem.MolFromXYZBlock()` -- produces a raw molecule with atoms and coordinates but no bonds
+2. **Infer connectivity** via `rdDetermineBonds.DetermineConnectivity()` -- adds single bonds based on interatomic distances
+3. **Assign bond orders** via `AllChem.AssignBondOrdersFromTemplate(template, raw_mol)` -- uses a SMILES-derived template to set correct bond orders (single, double, aromatic, etc.)
+4. **Sanitize** via `Chem.SanitizeMol()` -- initializes ring info, valence data, and aromaticity
+
+The template matching step is critical: it ensures bond orders are chemically correct (matching the SMILES specification) while preserving the original XYZ atom ordering. `AssignBondOrdersFromTemplate` documents that it preserves the input molecule's atom order.
+
+#### Atom Mapping Transfer
+
+Since RXNMapper operates on SMILES strings (not 3D structures), atom mapping numbers must be transferred from the mapped SMIRKS back onto the XYZ-loaded molecules. `transfer_atom_mapping()` handles this:
+
+1. Parse the mapped SMIRKS into per-molecule SMILES fragments (each with atom map numbers)
+2. For each (mapped SMILES, XYZ molecule) pair:
+   - Remove hydrogens from both to get heavy-atom-only molecules
+   - Run `GetSubstructMatch()` to find the atom correspondence
+   - Build a heavy-atom index map (`heavy_to_full`) to translate indices back to the full molecule
+   - Copy `GetAtomMapNum()` from the mapped SMILES atoms to the corresponding XYZ molecule atoms
+
+Hydrogens are left unmapped (map number 0), consistent with how the rest of the pipeline handles mapping.
+
+#### Charge Handling
+
+Partial charges are resolved in this priority order:
+
+1. **XYZ 5th column present:** Per-atom charges are read directly and set on the OpenFF molecule via `off_mol.partial_charges`. No charge computation is performed
+2. **No 5th column:** Gasteiger charges are computed via `off_mol.assign_partial_charges("gasteiger")`
+
+AM1-BCC charges are not used in the pipeline. Gasteiger computation is fast (milliseconds) compared to AM1-BCC (5-30 seconds per molecule).
+
+#### Geometry Pre-Optimization
+
+Before rigid-body optimization, each molecule undergoes internal geometry optimization via `optimize_molecule_geometry()`:
+
+1. Attempt MMFF94 force field optimization (`AllChem.MMFFGetMoleculeForceField`)
+2. Fall back to UFF (`AllChem.UFFOptimizeMolecule`) if MMFF94 parameterization fails
+
+This relaxes any strain in the input geometry while preserving the overall conformation. It runs on each molecule independently before the rigid-body phase freezes internal coordinates.
+
 ### Step 3: System Setup
 
 `optimize_ts_prep()` prepares the optimization system:
@@ -47,7 +113,7 @@ At this stage, each molecule has valid 3D coordinates but the molecules are not 
 
 **OpenMM Simulations:** Two separate OpenMM simulations are built -- one for all reactant molecules and one for all product molecules. Each simulation uses:
 - The [OpenFF 2.2.1 (Sage)](https://openforcefield.org/) force field for bonded and nonbonded parameters
-- AM1-BCC partial charges computed by the OpenFF toolkit
+- Partial charges: preset charges if provided (XYZ mode with 5th column), otherwise Gasteiger
 - A combined system containing all molecules on that side
 
 Building the simulations once and reusing them across optimization iterations avoids repeated force field parameterization.
@@ -103,7 +169,7 @@ The L-BFGS-B algorithm (Limited-memory Broyden-Fletcher-Goldfarb-Shanno with Bou
 - Translations are unbounded
 - Rotations are bounded to [-pi, pi] to avoid redundant parameterization
 - Gradients are computed by finite differences (SciPy's default for L-BFGS-B)
-- Default convergence: gradient tolerance `gtol=1e-5`, max 500 iterations
+- Default convergence: function tolerance `ftol=1e-12`, gradient tolerance `gtol=1e-5`, max 500 iterations
 
 ### Initial Conditions
 
@@ -123,11 +189,17 @@ Optimized geometries can be exported to XYZ files using `write_xyz_files()`, pro
 
 ```
 double_ended_ts_prep/
-  labeling.py       -- SMIRKS construction, atom mapping (RXNMapper), SMILES-to-molecule parsing
-  force_fields.py   -- Rigid-body optimization, OpenMM energy evaluation, XYZ export
+  labeling.py       -- SMIRKS construction, atom mapping (RXNMapper), SMILES-to-molecule parsing,
+                       atom mapping transfer for XYZ mode
+  force_fields.py   -- XYZ parsing, molecule construction, geometry optimization,
+                       rigid-body optimization, OpenMM energy evaluation, XYZ export
+scripts/
+  run_ts_prep.py    -- CLI entry point (XYZ and SMILES modes)
 ```
 
 ### Data Structures
+
+**`XYZData`**: Parsed XYZ file contents -- atom count, metadata dict, element list, coordinate array (N,3), and optional per-atom charges.
 
 **`MoleculeState`**: Holds per-molecule data during optimization -- the original RDKit molecule, initial coordinates, centroid (rotation pivot), and atom count.
 
@@ -137,6 +209,7 @@ double_ended_ts_prep/
 
 - OpenMM simulations are built once per optimization call, not per energy evaluation. This avoids repeated force field parameterization and system construction.
 - All energies are in kcal/mol. Coordinate units are Angstroms internally; OpenMM conversions (to nm and kJ/mol) are handled at the interface.
+- Gasteiger charges are used instead of AM1-BCC, reducing simulation setup time from minutes to seconds.
 
 ## References
 

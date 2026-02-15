@@ -37,10 +37,18 @@ from double_ended_ts_prep.force_fields import (
     compute_geometric_error,
     get_atom_mapping_correspondence,
     get_molecule_coordinates,
-    parse_xyz_metadata,
+    mol_from_xyz_block,
+    optimize_molecule_geometry,
+    parse_xyz_file,
     set_molecule_coordinates,
+    split_xyz_by_molecules,
 )
-from double_ended_ts_prep.labeling import build_smirks, map_smirks, smirks_to_molecules
+from double_ended_ts_prep.labeling import (
+    build_smirks,
+    map_smirks,
+    smirks_to_molecules,
+    transfer_atom_mapping,
+)
 
 MOLECULES_DIR = Path(__file__).resolve().parent.parent / "molecules"
 
@@ -143,52 +151,46 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Output directory (default: molecules/output/)",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output files instead of appending _1, _2, etc.",
+    )
 
     # Optimizer
     parser.add_argument("--alpha", type=float, default=1.0, help="FF energy weight (default: 1.0)")
     parser.add_argument(
-        "--beta", type=float, default=1.0, help="Geometric error weight (default: 1.0)"
+        "--beta", type=float, default=5.0, help="Geometric error weight (default: 1.0)"
     )
     parser.add_argument(
         "--max-iters", type=int, default=500, help="Max optimizer iterations (default: 500)"
     )
     parser.add_argument(
-        "--gtol",
-        type=float,
-        default=None,
-        help="Gradient tolerance (default: set by --tolerance level)",
+        "--gtol", type=float, default=1e-5, help="Gradient tolerance (default: 1e-5)"
     )
-    parser.add_argument(
-        "--tolerance",
-        choices=["loose", "standard", "tight"],
-        default="standard",
-        help="Convergence preset: loose (~5 iters), standard (~10-20 iters), tight (~50 iters)",
-    )
-
-    args = parser.parse_args()
-
-    # Apply tolerance preset if --gtol not explicitly provided
-    gtol_presets = {"loose": 1e-3, "standard": 1e-5, "tight": 1e-7}
-    if args.gtol is None:
-        args.gtol = gtol_presets[args.tolerance]
-
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:  # noqa: D103
     args = _parse_args()
     output_dir = Path(args.output_dir) if args.output_dir else MOLECULES_DIR / "output"
 
-    # ── Resolve input SMILES ─────────────────────────────────────────────
+    # ── Resolve input ────────────────────────────────────────────────────
+    # Charges: use XYZ 5th-column if available, otherwise Gasteiger
+    r_charges: list[list[float]] | None = None
+    p_charges: list[list[float]] | None = None
+
     if args.smiles:
         # SMILES mode: args are SMILES strings directly
         if not args.reactants:
             raise SystemExit("Error: --reactants required in SMILES mode")
         if not args.products:
             raise SystemExit("Error: --products required in SMILES mode")
-        r_smiles = args.reactants.split(".")
-        p_smiles = args.products.split(".")
+        r_smiles = args.reactants
+        p_smiles = args.products
         print("Mode:      SMILES input")
+        print("  Charges: Gasteiger")
+        xyz_mode = False
     else:
         # XYZ mode: args are filenames (or defaults)
         r_file = args.reactants[0] if args.reactants else "reactants.xyz"
@@ -198,21 +200,59 @@ def main() -> None:  # noqa: D103
         print("Mode:      XYZ input")
         print(f"Reactants: {reactant_path}")
         print(f"Products:  {product_path}")
+        xyz_mode = True
 
-        r_smiles = parse_xyz_metadata(reactant_path)
-        p_smiles = parse_xyz_metadata(product_path)
+        # Parse full XYZ files (coordinates + optional charges)
+        r_xyz = parse_xyz_file(reactant_path)
+        p_xyz = parse_xyz_file(product_path)
+
+        r_smiles = r_xyz.metadata["smiles"]
+        p_smiles = p_xyz.metadata["smiles"]
+        assert isinstance(r_smiles, list), f"Expected list of SMILES, got: {type(r_smiles)}"
+        assert isinstance(p_smiles, list), f"Expected list of SMILES, got: {type(p_smiles)}"
+
+        # Split multi-molecule XYZ into per-molecule chunks
+        r_mol_data = split_xyz_by_molecules(r_xyz, r_smiles)
+        p_mol_data = split_xyz_by_molecules(p_xyz, p_smiles)
+
+        # Build RDKit molecules from XYZ coordinates
+        r_mols_from_xyz = [
+            mol_from_xyz_block(d["elements"], d["coords"], d["smiles"]) for d in r_mol_data
+        ]
+        p_mols_from_xyz = [
+            mol_from_xyz_block(d["elements"], d["coords"], d["smiles"]) for d in p_mol_data
+        ]
+
+        # Use XYZ charges if 5th column present, otherwise Gasteiger
+        has_r_charges = all(d["charges"] is not None for d in r_mol_data)
+        has_p_charges = all(d["charges"] is not None for d in p_mol_data)
+        if has_r_charges and has_p_charges:
+            r_charges = [d["charges"] for d in r_mol_data]
+            p_charges = [d["charges"] for d in p_mol_data]
+            print("  Charges: from XYZ 5th column")
+        else:
+            print("  Charges: Gasteiger (no 5th column in XYZ)")
 
     # Determine output filenames
-    if args.name:
-        r_filename = f"{args.name}_reactants.xyz"
-        p_filename = f"{args.name}_products.xyz"
+    base_name = args.name or ""
+    if base_name:
+        r_base, p_base = f"{base_name}_reactants", f"{base_name}_products"
     else:
-        r_filename = "reactants.xyz"
-        p_filename = "products.xyz"
+        r_base, p_base = "reactants", "products"
+
+    r_filename = f"{r_base}.xyz"
+    p_filename = f"{p_base}.xyz"
+
+    if not args.overwrite:
+        n = 1
+        while (output_dir / r_filename).exists() or (output_dir / p_filename).exists():
+            r_filename = f"{r_base}_{n}.xyz"
+            p_filename = f"{p_base}_{n}.xyz"
+            n += 1
 
     print(f"Output:    {output_dir}")
     print(f"Params:    alpha={args.alpha}, beta={args.beta}, max_iters={args.max_iters}")
-    print(f"Tolerance: {args.tolerance} (gtol={args.gtol})")
+    print(f"Tolerance: ftol=1e-12, gtol={args.gtol}")
     print()
 
     # ── Phase A: Atom labeling ──────────────────────────────────────────
@@ -229,9 +269,21 @@ def main() -> None:  # noqa: D103
     mapped = map_smirks(smirks)
     print(f"  Mapped SMIRKS:   {mapped[:max_display]}{'...' if len(mapped) > max_display else ''}")
 
-    mols = smirks_to_molecules(mapped)
-    reactants = mols["reactants"]
-    products = mols["products"]
+    if xyz_mode:
+        # Transfer atom mapping from RXNMapper onto XYZ-loaded molecules
+        mapped_mols = transfer_atom_mapping(mapped, r_mols_from_xyz, p_mols_from_xyz)
+        reactants = mapped_mols["reactants"]
+        products = mapped_mols["products"]
+    else:
+        # SMILES mode: generate 3D coords from mapped SMIRKS (existing behavior)
+        mols = smirks_to_molecules(mapped)
+        reactants = mols["reactants"]
+        products = mols["products"]
+
+    # Optimize internal geometry (MMFF94) so each molecule is at its
+    # force-field minimum before being treated as a rigid body.
+    for mol in reactants + products:
+        optimize_molecule_geometry(mol)
 
     t_label = time.perf_counter() - t0
     print(f"  -> {len(reactants)} reactant(s), {len(products)} product(s)")
@@ -245,8 +297,14 @@ def main() -> None:  # noqa: D103
     reactant_states = [_build_molecule_state(mol) for mol in reactants]
     product_states = [_build_molecule_state(mol) for mol in products]
 
-    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(reactants)
-    product_simulation, product_atom_offsets = _build_openmm_simulation(products)
+    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(
+        reactants,
+        preset_charges=r_charges,
+    )
+    product_simulation, product_atom_offsets = _build_openmm_simulation(
+        products,
+        preset_charges=p_charges,
+    )
 
     correspondence = get_atom_mapping_correspondence(reactants, products)
     print(f"  Atom mapping pairs: {len(correspondence)}")
