@@ -55,7 +55,6 @@ result = optimize_ts_prep(
     mols["products"],
     alpha=1.0,   # force field weight
     beta=1.0,    # geometric alignment weight
-    gamma=1.0,   # cross-interaction attraction weight
 )
 
 print(f"Converged: {result['success']}")
@@ -100,12 +99,12 @@ products = mols["products"]    # list[Chem.Mol]
 
 ### Force Fields Module (`force_fields`)
 
-#### `optimize_ts_prep(reactants, products, alpha, beta, gamma, ...) -> dict`
+#### `optimize_ts_prep(reactants, products, alpha, beta, ...) -> dict`
 
 The main entry point. Optimizes rigid-body positions of reactant and product molecules by minimizing:
 
 ```
-E = alpha * (E_reactants + E_products) + beta * geometric_error + gamma * E_ghost_cross
+E = alpha * (E_reactants + E_products) + beta * geometric_error
 ```
 
 **Parameters:**
@@ -116,7 +115,6 @@ E = alpha * (E_reactants + E_products) + beta * geometric_error + gamma * E_ghos
 | `products` | `list[Chem.Mol]` | required | Product molecules with atom mapping and 3D coords |
 | `alpha` | `float` | `1.0` | Weight for intramolecular force field energy (kcal/mol) |
 | `beta` | `float` | `1.0` | Weight for geometric alignment penalty (kcal/mol per A^2) |
-| `gamma` | `float` | `0.0` | Weight for ghost cross-interaction attraction |
 | `max_iters` | `int` | `500` | Maximum L-BFGS-B iterations |
 | `gtol` | `float` | `1e-5` | Gradient tolerance for convergence |
 
@@ -132,15 +130,13 @@ Standalone utility to create a 3D-embedded RDKit molecule from a SMILES string.
 
 ## Tuning the Energy Weights
 
-The three weights (`alpha`, `beta`, `gamma`) control the balance between competing objectives:
+The two weights (`alpha`, `beta`) control the balance between competing objectives:
 
 - **`alpha` (force field):** Penalizes steric clashes and strain *within* each side. Higher values keep molecules from overlapping with their same-side neighbors but may resist geometric alignment.
 
 - **`beta` (geometric error):** Drives mapped atoms together. This is the primary coupling between reactants and products. Higher values force tighter alignment at the cost of potentially strained geometries.
 
-- **`gamma` (ghost cross-interaction):** Adds attractive dispersion and electrostatic forces *between* reactant and product molecules using soft-core potentials. This provides a physics-based attraction that complements the geometric penalty. Values around 0.5--2.0 are typical starting points.
-
-A reasonable default is `alpha=1.0, beta=1.0, gamma=1.0`. For reactions with large geometric rearrangements, increasing `beta` or `gamma` may help. For systems where steric clashes are a concern, increase `alpha`.
+A reasonable default is `alpha=1.0, beta=1.0`. For reactions with large geometric rearrangements, increasing `beta` may help. For systems where steric clashes are a concern, increase `alpha`.
 
 ## How It Works
 

@@ -15,7 +15,7 @@ from rxnmapper import RXNMapper
 CONFIDENCE_MINIMUM = 0.7
 
 
-def build_smirks(reactants: list[str], products: list[str]) -> str:
+def build_smirks(reactants: list[str] | str, products: list[str] | str) -> str:
     """Build a SMIRKS string from lists of reactant and product SMILES.
 
     Args:

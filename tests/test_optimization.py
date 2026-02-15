@@ -30,8 +30,8 @@ class TestOptimizeTSPrep:
             claisen_rxn.reactants,
             claisen_rxn.products,
             alpha=1.0,
-            beta=1.0,
-            max_iters=5000,
+            beta=5.0,
+            max_iters=500,
         )
 
     def test_returns_expected_keys(self, claisen_result: dict) -> None:

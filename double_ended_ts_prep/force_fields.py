@@ -559,9 +559,9 @@ def optimize_ts_prep(
     reactants: list[Chem.Mol],
     products: list[Chem.Mol],
     alpha: float = 1.0,
-    beta: float = 1.0,
+    beta: float = 5.0,
     max_iters: int = 500,
-    ftol: float = 1e-7,
+    ftol: float = 1e-12,
     gtol: float = 0,
 ) -> dict[str, list[Chem.Mol] | float | bool]:
     """Optimize reactant/product geometries for transition state search.
@@ -707,6 +707,59 @@ def optimize_ts_prep(
         "geometric_error": final_geo_error,
         "success": result.success,
     }
+
+
+def parse_xyz_metadata(path: str | Path) -> list[str]:
+    r"""Parse an XYZ file's comment line and return metadata.
+
+    Reads the second line of an XYZ file, which is expected to contain
+    semicolon-delimited key-value pairs (e.g., ``charge: 0; smiles: CCO.O;``).
+
+    The ``smiles`` field is split on ``.`` and returned as a list of individual
+    SMILES strings.
+
+    Args:
+        path: Path to the XYZ file
+
+    Returns:
+        List of SMILES as a ``list[str]``.
+
+    Raises:
+        FileNotFoundError: If the file does not exist
+        ValueError: If the comment line cannot be parsed or lacks a smiles field
+
+    Examples:
+        >>> import tempfile, pathlib
+        >>> p = pathlib.Path(tempfile.mktemp(suffix=".xyz"))
+        >>> _ = p.write_text("1\nsmiles: CCO;\nC 0.0 0.0 0.0\n")
+        >>> meta = parse_xyz_metadata(p)
+        >>> meta
+        ['CCO']
+        >>> p.unlink()
+    """
+    path = Path(path)
+    lines = path.read_text().splitlines()
+    if len(lines) < 2:  # noqa: PLR2004
+        raise ValueError(f"XYZ file {path} has fewer than 2 lines")
+
+    comment = lines[1]
+    metadata: dict[str, str] = {}
+    for raw_token in comment.split(";"):
+        stripped = raw_token.strip()
+        if not stripped or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", maxsplit=1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "smiles":
+            metadata[key] = value
+        else:
+            metadata[key] = value
+
+    if "smiles" not in metadata:
+        raise ValueError(f"XYZ file {path} comment line has no 'smiles' field")
+
+    return metadata["smiles"].split(".")
 
 
 def mol_to_xyz_string(mol: Chem.Mol, comment: str = "") -> str:
