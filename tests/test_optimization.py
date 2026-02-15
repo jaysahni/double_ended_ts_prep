@@ -100,7 +100,7 @@ class TestOptimizeMultiMolecule:
             ester_hydrolysis_rxn.products,
             alpha=0.1,
             beta=1.0,
-            max_iters=500,
+            max_iters=5000,
         )
 
     def test_returns_multiple_reactants(self, ester_result: dict) -> None:

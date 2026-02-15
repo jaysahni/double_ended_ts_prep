@@ -15,7 +15,7 @@ from rxnmapper import RXNMapper
 CONFIDENCE_MINIMUM = 0.7
 
 
-def build_smirks(reactants: list[str] | str, products: list[str] | str) -> str:
+def build_smirks(reactants: list[str], products: list[str]) -> str:
     """Build a SMIRKS string from lists of reactant and product SMILES.
 
     Args:
@@ -37,7 +37,6 @@ def build_smirks(reactants: list[str] | str, products: list[str] | str) -> str:
         raise ValueError("Reactants list cannot be empty")
     if not products:
         raise ValueError("Products list cannot be empty")
-
     # Validate all SMILES strings
     validated_reactants = []
     for smiles_raw in reactants:
