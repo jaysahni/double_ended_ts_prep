@@ -180,5 +180,5 @@ pyrightconfig.json
 
 # testing files
 poly53/
-molecules/
+output/
 benchmark_poly53.py
