@@ -117,7 +117,6 @@ E = alpha * (E_reactants + E_products) + beta * geometric_error
 | `beta` | `float` | `5.0` | Weight for geometric alignment penalty (kcal/mol per A^2) |
 | `max_iters` | `int` | `500` | Maximum L-BFGS-B iterations |
 | `ftol` | `float` | `1e-12` | Relative function value tolerance for convergence |
-| `gtol` | `float` | `1e-5` | Gradient tolerance for convergence |
 
 **Returns:** Dictionary with keys `reactants`, `products` (optimized `Mol` objects), `final_energy`, `geometric_error`, and `success`.
 
@@ -170,7 +169,7 @@ pixi run python scripts/run_ts_prep.py --smiles \
 | `--alpha` | `1.0` | Force field energy weight |
 | `--beta` | `1.0` | Geometric error weight |
 | `--max-iters` | `500` | Maximum L-BFGS-B iterations |
-| `--gtol` | `1e-5` | Gradient tolerance for convergence |
+| `--ftol` | `1e-12` | Function value tolerance for convergence |
 
 ### Output
 

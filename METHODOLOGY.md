@@ -96,15 +96,6 @@ Partial charges are resolved in this priority order:
 
 AM1-BCC charges are not used in the pipeline. Gasteiger computation is fast (milliseconds) compared to AM1-BCC (5-30 seconds per molecule).
 
-#### Geometry Pre-Optimization
-
-Before rigid-body optimization, each molecule undergoes internal geometry optimization via `optimize_molecule_geometry()`:
-
-1. Attempt MMFF94 force field optimization (`AllChem.MMFFGetMoleculeForceField`)
-2. Fall back to UFF (`AllChem.UFFOptimizeMolecule`) if MMFF94 parameterization fails
-
-This relaxes any strain in the input geometry while preserving the overall conformation. It runs on each molecule independently before the rigid-body phase freezes internal coordinates.
-
 ### Step 3: System Setup
 
 `optimize_ts_prep()` prepares the optimization system:
@@ -169,7 +160,7 @@ The L-BFGS-B algorithm (Limited-memory Broyden-Fletcher-Goldfarb-Shanno with Bou
 - Translations are unbounded
 - Rotations are bounded to [-pi, pi] to avoid redundant parameterization
 - Gradients are computed by finite differences (SciPy's default for L-BFGS-B)
-- Default convergence: function tolerance `ftol=1e-12`, gradient tolerance `gtol=1e-5`, max 500 iterations
+- Default convergence: function tolerance `ftol=1e-12`, max 100 iterations
 
 ### Initial Conditions
 

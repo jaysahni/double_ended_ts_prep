@@ -13,8 +13,8 @@ from rdkit import Chem
 
 from double_ended_ts_prep.force_fields import (
     _assign_partial_charges,
-    _build_openmm_simulation,
-    _compute_openmm_energy,
+    _build_pairwise_params,
+    _compute_pairwise_energy,
     get_molecule_coordinates,
     optimize_ts_prep,
     prepare_molecule_from_smiles,
@@ -32,10 +32,10 @@ class TestChargeAssignmentFallback:
     def test_normal_organic_gets_am1bcc(self) -> None:
         """Normal organic molecules should use AM1-BCC without issue."""
         mol = prepare_molecule_from_smiles("CCO")
-        sim, _ = _build_openmm_simulation([mol])
-        # Simulation should build without error
+        params, _ = _build_pairwise_params([mol])
+        # Params should build without error
         coords = get_molecule_coordinates(mol)
-        e = _compute_openmm_energy(sim, coords)
+        e = _compute_pairwise_energy(coords, params)
         assert np.isfinite(e)
 
     def test_bromide_ion_gets_charges(self) -> None:
@@ -71,10 +71,10 @@ class TestChargeAssignmentFallback:
         total_q = sum(pc.m_as("elementary_charge") for pc in off_mol.partial_charges)
         assert total_q == pytest.approx(1.0, abs=0.01)
 
-    def test_sn2_simulation_builds(self, sn2_rxn: ReactionFixture) -> None:
-        """Full SN2 reaction (CCl + Br⁻ -> CBr + Cl⁻) should build simulations."""
-        sim_r, _ = _build_openmm_simulation(sn2_rxn.reactants)
-        _sim_p, _ = _build_openmm_simulation(sn2_rxn.products)
+    def test_sn2_params_build(self, sn2_rxn: ReactionFixture) -> None:
+        """Full SN2 reaction (CCl + Br⁻ -> CBr + Cl⁻) should build params."""
+        params_r, _ = _build_pairwise_params(sn2_rxn.reactants)
+        _params_p, _ = _build_pairwise_params(sn2_rxn.products)
         # Both should produce finite energies
         offset = 0
         coords = []
@@ -84,7 +84,7 @@ class TestChargeAssignmentFallback:
             coords.append(c)
             offset += 10.0
         r_coords = np.vstack(coords)
-        e = _compute_openmm_energy(sim_r, r_coords)
+        e = _compute_pairwise_energy(r_coords, params_r)
         assert np.isfinite(e)
 
 
@@ -94,18 +94,18 @@ class TestChargeAssignmentFallback:
 class TestUndefinedStereochemistry:
     """Molecules with undefined stereo must not crash OpenFF conversion."""
 
-    def test_cope_product_builds_simulation(self, cope_rxn: ReactionFixture) -> None:
+    def test_cope_product_builds_params(self, cope_rxn: ReactionFixture) -> None:
         """Cope product has undefined E/Z bond -- should now work."""
-        sim, _ = _build_openmm_simulation(cope_rxn.products)
+        params, _ = _build_pairwise_params(cope_rxn.products)
         coords = np.vstack([get_molecule_coordinates(m) for m in cope_rxn.products])
-        e = _compute_openmm_energy(sim, coords)
+        e = _compute_pairwise_energy(coords, params)
         assert np.isfinite(e)
 
-    def test_aldol_product_builds_simulation(self, aldol_rxn: ReactionFixture) -> None:
+    def test_aldol_product_builds_params(self, aldol_rxn: ReactionFixture) -> None:
         """Aldol product has undefined chiral center -- should now work."""
-        sim, _ = _build_openmm_simulation(aldol_rxn.products)
+        params, _ = _build_pairwise_params(aldol_rxn.products)
         coords = np.vstack([get_molecule_coordinates(m) for m in aldol_rxn.products])
-        e = _compute_openmm_energy(sim, coords)
+        e = _compute_pairwise_energy(coords, params)
         assert np.isfinite(e)
 
     def test_cope_full_optimization(self, cope_rxn: ReactionFixture) -> None:
@@ -145,7 +145,7 @@ class TestRadicalDetection:
         mol = Chem.MolFromSmiles("[Cl]", ps)
         mol = Chem.AddHs(mol)
         with pytest.raises(ValueError, match="radical"):
-            _build_openmm_simulation([mol])
+            _build_pairwise_params([mol])
 
     def test_methyl_radical_raises_clear_error(self) -> None:
         ps = Chem.SmilesParserParams()
@@ -153,7 +153,7 @@ class TestRadicalDetection:
         mol = Chem.MolFromSmiles("[CH3]", ps)
         mol = Chem.AddHs(mol)
         with pytest.raises(ValueError, match="radical"):
-            _build_openmm_simulation([mol])
+            _build_pairwise_params([mol])
 
 
 # ── Full optimization on previously-failing reactions ───────────────────

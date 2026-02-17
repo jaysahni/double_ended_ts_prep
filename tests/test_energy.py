@@ -13,8 +13,8 @@ import pytest
 from rdkit import Chem
 
 from double_ended_ts_prep.force_fields import (
-    _build_openmm_simulation,
-    _compute_openmm_energy,
+    _build_pairwise_params,
+    _compute_pairwise_energy,
     compute_mmff_energy,
     get_molecule_coordinates,
     prepare_molecule_from_smiles,
@@ -51,57 +51,34 @@ class TestMMFFEnergy:
         assert e_stretched > e_relaxed
 
 
-# ── OpenMM energy ───────────────────────────────────────────────────────
+# ── Pairwise (intermolecular LJ + Coulomb) energy ─────────────────────
 
 
-class TestOpenMMEnergy:
-    """Tests for the OpenMM Sage force field energy calculations."""
+class TestPairwiseEnergy:
+    """Tests for the pairwise intermolecular energy calculations."""
 
-    @pytest.fixture(scope="class")
-    def ethanol_sim(self):
+    def test_single_molecule_zero_energy(self) -> None:
+        """A single molecule has no intermolecular interactions → energy = 0."""
         mol = prepare_molecule_from_smiles("CCO")
-        sim, offsets = _build_openmm_simulation([mol])
-        return sim, offsets, mol
-
-    def test_energy_is_finite(self, ethanol_sim) -> None:
-        sim, _, mol = ethanol_sim
+        params, _ = _build_pairwise_params([mol])
         coords = get_molecule_coordinates(mol)
-        e = _compute_openmm_energy(sim, coords)
-        assert np.isfinite(e)
+        e = _compute_pairwise_energy(coords, params)
+        assert e == pytest.approx(0.0)
 
-    def test_equilibrium_energy_reasonable(self, ethanol_sim) -> None:
-        """Embedded geometry should give a moderate energy, not billions."""
-        sim, _, mol = ethanol_sim
-        coords = get_molecule_coordinates(mol)
-        e = _compute_openmm_energy(sim, coords)
-        assert abs(e) < 500.0, f"Equilibrium energy {e:.1f} kcal/mol is too large"
-
-    def test_distorted_energy_increases(self, ethanol_sim) -> None:
-        sim, _, mol = ethanol_sim
-        coords = get_molecule_coordinates(mol)
-        e_eq = _compute_openmm_energy(sim, coords)
-
-        # Distort: push first atom 5 A away
-        distorted = coords.copy()
-        distorted[0] += [5.0, 0.0, 0.0]
-        e_dist = _compute_openmm_energy(sim, distorted)
-        assert e_dist > e_eq
-
-    def test_multi_molecule_simulation(self) -> None:
-        """Two molecules in one simulation should have finite energy at equilibrium."""
+    def test_multi_molecule_finite_energy(self) -> None:
+        """Two well-separated molecules should have finite, small energy."""
         mol1 = prepare_molecule_from_smiles("C")
         mol2 = prepare_molecule_from_smiles("O")
-        sim, offsets = _build_openmm_simulation([mol1, mol2])
+        params, offsets = _build_pairwise_params([mol1, mol2])
 
         assert len(offsets) == 2
         assert offsets[0] == 0
         assert offsets[1] == mol1.GetNumAtoms()
 
-        # Build combined coordinate array with molecules well separated
         c1 = get_molecule_coordinates(mol1)
         c2 = get_molecule_coordinates(mol2) + np.array([20.0, 0.0, 0.0])
         combined = np.vstack([c1, c2])
-        e = _compute_openmm_energy(sim, combined)
+        e = _compute_pairwise_energy(combined, params)
         assert np.isfinite(e)
         assert abs(e) < 500.0
 
@@ -109,10 +86,29 @@ class TestOpenMMEnergy:
         """Two molecules at the same position should have enormous repulsive energy."""
         mol1 = prepare_molecule_from_smiles("C")
         mol2 = prepare_molecule_from_smiles("C")
-        sim, _offsets = _build_openmm_simulation([mol1, mol2])
+        params, _offsets = _build_pairwise_params([mol1, mol2])
 
         c1 = get_molecule_coordinates(mol1)
         c2 = get_molecule_coordinates(mol2)
         combined = np.vstack([c1, c2])  # overlapping!
-        e = _compute_openmm_energy(sim, combined)
+        e = _compute_pairwise_energy(combined, params)
         assert e > 1e4, f"Overlapping energy {e:.1f} should be >> 10000 kcal/mol"
+
+    def test_energy_decreases_with_separation(self) -> None:
+        """Moving molecules apart should decrease repulsive energy."""
+        mol1 = prepare_molecule_from_smiles("C")
+        mol2 = prepare_molecule_from_smiles("C")
+        params, _ = _build_pairwise_params([mol1, mol2])
+
+        c1 = get_molecule_coordinates(mol1)
+        c2 = get_molecule_coordinates(mol2)
+
+        # Close together
+        combined_close = np.vstack([c1, c2 + np.array([2.0, 0.0, 0.0])])
+        e_close = _compute_pairwise_energy(combined_close, params)
+
+        # Far apart
+        combined_far = np.vstack([c1, c2 + np.array([20.0, 0.0, 0.0])])
+        e_far = _compute_pairwise_energy(combined_far, params)
+
+        assert e_close > e_far

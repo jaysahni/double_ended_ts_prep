@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,14 +32,13 @@ from scipy.optimize import minimize
 from double_ended_ts_prep.force_fields import (
     SystemState,
     _build_molecule_state,
-    _build_openmm_simulation,
+    _build_pairwise_params,
     _compute_rigid_body_energy,
     apply_rigid_transform,
     compute_geometric_error,
     get_atom_mapping_correspondence,
     get_molecule_coordinates,
     mol_from_xyz_block,
-    optimize_molecule_geometry,
     parse_xyz_file,
     set_molecule_coordinates,
     split_xyz_by_molecules,
@@ -160,13 +160,13 @@ def _parse_args() -> argparse.Namespace:
     # Optimizer
     parser.add_argument("--alpha", type=float, default=1.0, help="FF energy weight (default: 1.0)")
     parser.add_argument(
-        "--beta", type=float, default=5.0, help="Geometric error weight (default: 1.0)"
+        "--beta", type=float, default=0.1, help="Geometric error weight (default: 0.1)"
     )
     parser.add_argument(
         "--max-iters", type=int, default=500, help="Max optimizer iterations (default: 500)"
     )
     parser.add_argument(
-        "--gtol", type=float, default=1e-5, help="Gradient tolerance (default: 1e-5)"
+        "--ftol", type=float, default=1e-12, help="Function value tolerance (default: 1e-12)"
     )
     return parser.parse_args()
 
@@ -252,7 +252,7 @@ def main() -> None:  # noqa: D103
 
     print(f"Output:    {output_dir}")
     print(f"Params:    alpha={args.alpha}, beta={args.beta}, max_iters={args.max_iters}")
-    print(f"Tolerance: ftol=1e-12, gtol={args.gtol}")
+    print(f"Tolerance: ftol={args.ftol}")
     print()
 
     # ── Phase A: Atom labeling ──────────────────────────────────────────
@@ -280,11 +280,6 @@ def main() -> None:  # noqa: D103
         reactants = mols["reactants"]
         products = mols["products"]
 
-    # Optimize internal geometry (MMFF94) so each molecule is at its
-    # force-field minimum before being treated as a rigid body.
-    for mol in reactants + products:
-        optimize_molecule_geometry(mol)
-
     t_label = time.perf_counter() - t0
     print(f"  -> {len(reactants)} reactant(s), {len(products)} product(s)")
     print(f"  -> Completed in {t_label:.2f}s")
@@ -297,14 +292,11 @@ def main() -> None:  # noqa: D103
     reactant_states = [_build_molecule_state(mol) for mol in reactants]
     product_states = [_build_molecule_state(mol) for mol in products]
 
-    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(
-        reactants,
-        preset_charges=r_charges,
-    )
-    product_simulation, product_atom_offsets = _build_openmm_simulation(
-        products,
-        preset_charges=p_charges,
-    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_r = pool.submit(_build_pairwise_params, reactants, preset_charges=r_charges)
+        fut_p = pool.submit(_build_pairwise_params, products, preset_charges=p_charges)
+        reactant_pp, reactant_atom_offsets = fut_r.result()
+        product_pp, product_atom_offsets = fut_p.result()
 
     correspondence = get_atom_mapping_correspondence(reactants, products)
     print(f"  Atom mapping pairs: {len(correspondence)}")
@@ -317,8 +309,8 @@ def main() -> None:  # noqa: D103
         atom_mapping=correspondence,
         n_reactant_params=n_reactant_params,
         n_product_params=n_product_params,
-        reactant_simulation=reactant_simulation,
-        product_simulation=product_simulation,
+        reactant_params=reactant_pp,
+        product_params=product_pp,
         reactant_atom_offsets=reactant_atom_offsets,
         product_atom_offsets=product_atom_offsets,
     )
@@ -346,7 +338,7 @@ def main() -> None:  # noqa: D103
         args=(system_state, args.alpha, args.beta),
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": args.max_iters, "ftol": 1e-12, "gtol": args.gtol},
+        options={"maxiter": args.max_iters, "ftol": args.ftol},
     )
 
     t_opt = time.perf_counter() - t0

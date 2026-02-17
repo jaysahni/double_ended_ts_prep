@@ -14,7 +14,7 @@ import pytest
 from double_ended_ts_prep.force_fields import (
     SystemState,
     _build_molecule_state,
-    _build_openmm_simulation,
+    _build_pairwise_params,
     _compute_rigid_body_energy,
     get_atom_mapping_correspondence,
 )
@@ -26,8 +26,8 @@ def _build_system_state(rxn: ReactionFixture) -> SystemState:
     """Build a SystemState from a ReactionFixture."""
     r_states = [_build_molecule_state(m) for m in rxn.reactants]
     p_states = [_build_molecule_state(m) for m in rxn.products]
-    r_sim, r_offsets = _build_openmm_simulation(rxn.reactants)
-    p_sim, p_offsets = _build_openmm_simulation(rxn.products)
+    r_pp, r_offsets = _build_pairwise_params(rxn.reactants)
+    p_pp, p_offsets = _build_pairwise_params(rxn.products)
     corr = get_atom_mapping_correspondence(rxn.reactants, rxn.products)
     return SystemState(
         reactant_states=r_states,
@@ -35,8 +35,8 @@ def _build_system_state(rxn: ReactionFixture) -> SystemState:
         atom_mapping=corr,
         n_reactant_params=6 * len(rxn.reactants),
         n_product_params=6 * len(rxn.products),
-        reactant_simulation=r_sim,
-        product_simulation=p_sim,
+        reactant_params=r_pp,
+        product_params=p_pp,
         reactant_atom_offsets=r_offsets,
         product_atom_offsets=p_offsets,
     )
@@ -55,16 +55,22 @@ class TestObjectiveFunction:
         e = _compute_rigid_body_energy(params, claisen_system, alpha=1.0, beta=1.0)
         assert np.isfinite(e)
 
-    def test_alpha_zero_removes_ff_contribution(self, claisen_system: SystemState) -> None:
-        """With alpha=0, only geometric error should matter."""
-        n = claisen_system.n_reactant_params + claisen_system.n_product_params
+    def test_alpha_zero_removes_ff_contribution(
+        self, isocyanate_hydration_rxn: ReactionFixture
+    ) -> None:
+        """With alpha=0, only geometric error should matter.
+
+        Uses a multi-molecule reaction (2 reactants) so intermolecular FF
+        energy is non-zero and alpha actually affects the result.
+        """
+        system = _build_system_state(isocyanate_hydration_rxn)
+        n = system.n_reactant_params + system.n_product_params
         params = np.zeros(n)
 
-        e_full = _compute_rigid_body_energy(params, claisen_system, alpha=1.0, beta=1.0)
-        e_no_ff = _compute_rigid_body_energy(params, claisen_system, alpha=0.0, beta=1.0)
+        e_full = _compute_rigid_body_energy(params, system, alpha=1.0, beta=1.0)
+        e_no_ff = _compute_rigid_body_energy(params, system, alpha=0.0, beta=1.0)
 
         # With alpha=0 the energy is purely geometric, should differ from full
-        # (unless FF energy happens to be exactly 0, which it won't be)
         assert e_full != pytest.approx(e_no_ff, abs=0.01)
 
     def test_beta_zero_removes_geo_contribution(self, claisen_system: SystemState) -> None:

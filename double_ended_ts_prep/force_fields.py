@@ -13,17 +13,17 @@ The TS prep workflow involves:
 
 from __future__ import annotations
 
+import functools
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import openmm
-import openmm.app
-from openff.interchange import Interchange
 from openff.toolkit import ForceField as OFFForceField
 from openff.toolkit import Molecule as OFFMolecule
+from openff.toolkit import Topology as OFFTopology
 from openff.units import unit as off_unit
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds
@@ -58,11 +58,31 @@ class MoleculeState:
 
 
 @dataclass
+class PairwiseParams:
+    """Lightweight per-atom force field parameters for pairwise energy evaluation.
+
+    Stores only the data needed for intermolecular Lennard-Jones and Coulomb
+    interactions, avoiding the overhead of a full OpenMM simulation.
+
+    Attributes:
+        charges: Partial charges in elementary charge units, shape (N,)
+        sigma: LJ sigma parameters in Angstroms, shape (N,)
+        epsilon: LJ epsilon parameters in kcal/mol, shape (N,)
+        mol_boundaries: Starting atom index of each molecule in the combined system
+    """
+
+    charges: NDArray[np.floating]
+    sigma: NDArray[np.floating]
+    epsilon: NDArray[np.floating]
+    mol_boundaries: list[int]
+
+
+@dataclass
 class SystemState:
     """Complete state for rigid-body optimization of reactants and products.
 
     Reactants and products are completely isolated energy systems. Each side
-    has its own OpenMM simulation for computing intramolecular + intermolecular
+    uses lightweight pairwise parameters for computing intermolecular
     interactions within that side only. The geometric error (via atom mapping)
     is the only coupling between the two sides.
 
@@ -72,8 +92,8 @@ class SystemState:
         atom_mapping: Correspondence between (r_mol_idx, atom_idx) -> (p_mol_idx, atom_idx)
         n_reactant_params: Total DOFs for reactant side (6 * num_reactants)
         n_product_params: Total DOFs for product side (6 * num_products)
-        reactant_simulation: OpenMM simulation for reactant system only
-        product_simulation: OpenMM simulation for product system only
+        reactant_params: Pairwise LJ + charge parameters for reactant system
+        product_params: Pairwise LJ + charge parameters for product system
         reactant_atom_offsets: Starting atom index of each reactant in the combined system
         product_atom_offsets: Starting atom index of each product in the combined system
     """
@@ -83,8 +103,8 @@ class SystemState:
     atom_mapping: dict[tuple[int, int], tuple[int, int]]
     n_reactant_params: int
     n_product_params: int
-    reactant_simulation: openmm.app.Simulation
-    product_simulation: openmm.app.Simulation
+    reactant_params: PairwiseParams
+    product_params: PairwiseParams
     reactant_atom_offsets: list[int]
     product_atom_offsets: list[int]
 
@@ -347,27 +367,6 @@ def compute_mmff_energy(mol: Chem.Mol) -> float:
     return ff.CalcEnergy()
 
 
-def optimize_molecule_geometry(mol: Chem.Mol, max_iters: int = 200) -> None:
-    """Optimize a molecule's 3D geometry using MMFF94 (UFF fallback).
-
-    Minimizes internal coordinates so each molecule is at a classical
-    force-field energy minimum before rigid-body optimization.  The
-    molecule is modified in place.
-
-    Args:
-        mol: RDKit Mol with a conformer (modified in place).
-        max_iters: Maximum minimization iterations.
-    """
-    mmff_props = AllChem.MMFFGetMoleculeProperties(mol)  # type: ignore[attr-defined]
-    if mmff_props is not None:
-        ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props)  # type: ignore[attr-defined]
-        if ff is not None:
-            ff.Minimize(maxIts=max_iters)
-            return
-    # Fallback to UFF
-    AllChem.UFFOptimizeMolecule(mol, maxIters=max_iters)  # type: ignore[attr-defined]
-
-
 def compute_geometric_error(
     reactant_coords_list: list[NDArray[np.floating]],
     product_coords_list: list[NDArray[np.floating]],
@@ -426,16 +425,22 @@ def _assign_partial_charges(off_mol: OFFMolecule) -> None:
     raise ValueError(f"All charge methods ({', '.join(methods)}) failed for molecule: {smiles}")
 
 
-def _build_openmm_simulation(
+@functools.lru_cache(maxsize=1)
+def _get_forcefield() -> OFFForceField:
+    """Load and cache the OpenFF force field (avoids re-parsing XML on each call)."""
+    return OFFForceField("openff_unconstrained-2.2.1.offxml")
+
+
+def _build_pairwise_params(
     mols: list[Chem.Mol],
     preset_charges: list[list[float]] | None = None,
-) -> tuple[openmm.app.Simulation, list[int]]:
-    """Build an OpenMM simulation from a list of RDKit molecules.
+) -> tuple[PairwiseParams, list[int]]:
+    """Extract per-atom LJ and charge parameters for pairwise energy evaluation.
 
-    Converts RDKit molecules to OpenFF molecules, assigns partial charges,
-    builds an Interchange with the OpenFF-2.2.1 force field, and creates an
-    OpenMM simulation.  This is called ONCE during setup and the simulation
-    object is reused for repeated energy evaluations.
+    Since the optimization treats molecules as rigid bodies, only intermolecular
+    vdW (Lennard-Jones) and Coulomb interactions change. This function extracts
+    just the parameters needed for those calculations, skipping the expensive
+    Interchange and OpenMM simulation construction.
 
     Args:
         mols: List of RDKit Mol objects with conformers.
@@ -446,19 +451,18 @@ def _build_openmm_simulation(
             are computed.
 
     Returns:
-        Tuple of (OpenMM Simulation, list of atom offsets for each molecule).
+        Tuple of (PairwiseParams, list of atom offsets for each molecule).
 
     Raises:
         ValueError: If a molecule contains radicals or force field assignment
             fails.
     """
-    forcefield = OFFForceField("openff_unconstrained-2.2.1.offxml")
+    forcefield = _get_forcefield()
     off_mols: list[OFFMolecule] = []
     atom_offsets: list[int] = []
     running_offset = 0
 
     for i, mol in enumerate(mols):
-        # Check for radicals before attempting OpenFF conversion
         smiles = Chem.MolToSmiles(mol)
         for atom in mol.GetAtoms():
             if atom.GetNumRadicalElectrons() > 0:
@@ -481,31 +485,97 @@ def _build_openmm_simulation(
         off_mols.append(off_mol)
         running_offset += mol.GetNumAtoms()
 
-    interchange = Interchange.from_smirnoff(forcefield, off_mols)
-    integrator = openmm.VerletIntegrator(1 * openmm.unit.femtoseconds)  # type: ignore[unresolved-attribute]
-    simulation = interchange.to_openmm_simulation(integrator)
+    total_atoms = running_offset
 
-    return simulation, atom_offsets
+    # Extract charges from OpenFF molecules
+    all_charges = np.zeros(total_atoms, dtype=np.float64)
+    for i, off_mol in enumerate(off_mols):
+        offset = atom_offsets[i]
+        n = off_mol.n_atoms
+        all_charges[offset : offset + n] = off_mol.partial_charges.m_as(off_unit.elementary_charge)
+
+    # Extract vdW parameters via label_molecules (much cheaper than Interchange)
+    topology = OFFTopology.from_molecules(off_mols)
+    labels = forcefield.label_molecules(topology)
+    all_sigma = np.zeros(total_atoms, dtype=np.float64)
+    all_epsilon = np.zeros(total_atoms, dtype=np.float64)
+
+    global_atom_idx = 0
+    for mol_labels in labels:
+        vdw_dict = mol_labels["vdW"]
+        for atom_indices, parameter in vdw_dict.items():
+            idx = global_atom_idx + atom_indices[0]
+            all_sigma[idx] = parameter.sigma.m_as(off_unit.angstrom)
+            all_epsilon[idx] = parameter.epsilon.m_as(off_unit.kilocalorie_per_mole)
+        global_atom_idx += len(vdw_dict)
+
+    params = PairwiseParams(
+        charges=all_charges,
+        sigma=all_sigma,
+        epsilon=all_epsilon,
+        mol_boundaries=atom_offsets,
+    )
+    return params, atom_offsets
 
 
-def _compute_openmm_energy(
-    simulation: openmm.app.Simulation,
-    coords_angstrom: NDArray[np.floating],
+# Coulomb constant for kcal/mol when charges are in e and distance in Angstroms
+_COULOMB_CONST_KCAL_A = 332.064
+
+
+def _compute_pairwise_energy(
+    coords: NDArray[np.floating],
+    params: PairwiseParams,
 ) -> float:
-    """Compute OpenMM energy for given coordinates.
+    """Compute intermolecular LJ + Coulomb energy using vectorized NumPy.
+
+    Only evaluates pairwise interactions between atoms in *different* molecules.
+    Intramolecular terms are constant for rigid bodies and omitted.
 
     Args:
-        simulation: Pre-built OpenMM simulation (reused across iterations)
-        coords_angstrom: (N, 3) coordinates in Angstroms
+        coords: (N, 3) coordinates in Angstroms
+        params: Pre-computed per-atom LJ and charge parameters
 
     Returns:
         Energy in kcal/mol
     """
-    # OpenMM expects positions in nanometers
-    simulation.context.setPositions(coords_angstrom / 10)
-    state = simulation.context.getState(getEnergy=True)
-    energy_kj = state.getPotentialEnergy() / openmm.unit.kilojoules_per_mole
-    return float(energy_kj) * 0.239006  # kJ/mol → kcal/mol
+    n = len(coords)
+    if n == 0:
+        return 0.0
+
+    boundaries = params.mol_boundaries
+    n_mols = len(boundaries)
+    if n_mols <= 1:
+        return 0.0  # Single molecule: no intermolecular interactions
+
+    # Build molecule-index array for each atom
+    mol_ids = np.zeros(n, dtype=np.int32)
+    for m in range(n_mols - 1):
+        mol_ids[boundaries[m] : boundaries[m + 1]] = m
+    mol_ids[boundaries[-1] :] = n_mols - 1
+
+    # Pairwise distance matrix (upper triangle only)
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]  # (N, N, 3)
+    dist = np.sqrt(np.sum(diff**2, axis=2))  # (N, N)
+
+    # Mask: only intermolecular pairs in upper triangle
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    inter_mask = mol_ids[i_idx] != mol_ids[j_idx]
+    i_inter = i_idx[inter_mask]
+    j_inter = j_idx[inter_mask]
+    r = dist[i_inter, j_inter]
+
+    # Lorentz-Berthelot combining rules
+    sig_ij = (params.sigma[i_inter] + params.sigma[j_inter]) / 2.0
+    eps_ij = np.sqrt(params.epsilon[i_inter] * params.epsilon[j_inter])
+
+    # Lennard-Jones 12-6
+    sr6 = (sig_ij / r) ** 6
+    e_lj = np.sum(4.0 * eps_ij * (sr6**2 - sr6))
+
+    # Coulomb
+    e_coul = np.sum(_COULOMB_CONST_KCAL_A * params.charges[i_inter] * params.charges[j_inter] / r)
+
+    return float(e_lj + e_coul)
 
 
 def _compute_rigid_body_energy(
@@ -519,13 +589,13 @@ def _compute_rigid_body_energy(
     Energy = alpha * (E_reactants + E_products) + beta * geometric_error
 
     Reactants and products are completely isolated energy systems:
-    - E_reactants: OpenMM energy computed ONLY among reactant molecules
-    - E_products: OpenMM energy computed ONLY among product molecules
+    - E_reactants: Intermolecular LJ + Coulomb among reactant molecules
+    - E_products: Intermolecular LJ + Coulomb among product molecules
     - geometric_error via atom mapping couples the two sides geometrically
 
     Args:
         params: 1D array of all rigid body parameters
-        system_state: SystemState with pre-built OpenMM simulations
+        system_state: SystemState with pre-built pairwise parameters
         alpha: Weight for force field energy term (kcal/mol)
         beta: Weight for geometric error term (kcal/mol per Angstrom^2)
 
@@ -551,8 +621,8 @@ def _compute_rigid_body_energy(
         offset = system_state.reactant_atom_offsets[i]
         combined_reactant_coords[offset : offset + state.atom_count] = new_coords
 
-    reactant_energy = _compute_openmm_energy(
-        system_state.reactant_simulation, combined_reactant_coords
+    reactant_energy = _compute_pairwise_energy(
+        combined_reactant_coords, system_state.reactant_params
     )
 
     # === PRODUCT SYSTEM (isolated) ===
@@ -569,9 +639,7 @@ def _compute_rigid_body_energy(
         offset = system_state.product_atom_offsets[i]
         combined_product_coords[offset : offset + state.atom_count] = new_coords
 
-    product_energy = _compute_openmm_energy(
-        system_state.product_simulation, combined_product_coords
-    )
+    product_energy = _compute_pairwise_energy(combined_product_coords, system_state.product_params)
 
     # Energy from isolated systems
     ff_energy = alpha * (reactant_energy + product_energy)
@@ -610,7 +678,6 @@ def optimize_ts_prep(
     beta: float = 5.0,
     max_iters: int = 500,
     ftol: float = 1e-12,
-    gtol: float = 1e-5,
     reactant_charges: list[list[float]] | None = None,
     product_charges: list[list[float]] | None = None,
 ) -> dict[str, list[Chem.Mol] | float | bool]:
@@ -630,7 +697,6 @@ def optimize_ts_prep(
         beta: Weight for geometric error term (default 1.0 kcal/mol per Angstrom^2)
         max_iters: Maximum L-BFGS iterations
         ftol: Relative function value tolerance for convergence (default 1e-12)
-        gtol: Gradient tolerance for convergence (default 1e-5)
         reactant_charges: Optional per-molecule charge lists for reactants.
             Each inner list has per-atom partial charges in elementary charge
             units.  When provided, skips Gasteiger computation for reactants.
@@ -679,15 +745,12 @@ def optimize_ts_prep(
     reactant_states = [_build_molecule_state(mol) for mol in reactants]
     product_states = [_build_molecule_state(mol) for mol in products]
 
-    # Build OpenMM simulations for each side (done ONCE, reused in optimization loop)
-    reactant_simulation, reactant_atom_offsets = _build_openmm_simulation(
-        reactants,
-        preset_charges=reactant_charges,
-    )
-    product_simulation, product_atom_offsets = _build_openmm_simulation(
-        products,
-        preset_charges=product_charges,
-    )
+    # Build pairwise parameters for each side in parallel (done ONCE, reused in optimization loop)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_r = pool.submit(_build_pairwise_params, reactants, preset_charges=reactant_charges)
+        fut_p = pool.submit(_build_pairwise_params, products, preset_charges=product_charges)
+        reactant_pp, reactant_atom_offsets = fut_r.result()
+        product_pp, product_atom_offsets = fut_p.result()
 
     # Create system state
     n_reactant_params = 6 * len(reactants)
@@ -698,8 +761,8 @@ def optimize_ts_prep(
         atom_mapping=correspondence,
         n_reactant_params=n_reactant_params,
         n_product_params=n_product_params,
-        reactant_simulation=reactant_simulation,
-        product_simulation=product_simulation,
+        reactant_params=reactant_pp,
+        product_params=product_pp,
         reactant_atom_offsets=reactant_atom_offsets,
         product_atom_offsets=product_atom_offsets,
     )
@@ -722,7 +785,7 @@ def optimize_ts_prep(
         args=(system_state, alpha, beta),
         method="L-BFGS-B",
         bounds=bounds,
-        options={"maxiter": max_iters, "ftol": ftol, "gtol": gtol},
+        options={"maxiter": max_iters, "ftol": ftol},
     )
 
     # Extract final parameters

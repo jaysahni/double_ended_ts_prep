@@ -5,6 +5,7 @@ as well as the labeling methods that process SMIRKS expressions into atom-labele
 for later atom-tracking steps.
 """
 
+import functools
 import warnings
 
 from rdkit import Chem
@@ -13,6 +14,12 @@ from rxnmapper import RXNMapper
 
 # minimum confidence for successful use of rxnmapper without warning
 CONFIDENCE_MINIMUM = 0.7
+
+
+@functools.lru_cache(maxsize=1)
+def _get_rxn_mapper() -> RXNMapper:
+    """Return a cached RXNMapper instance (avoids reloading the model)."""
+    return RXNMapper()
 
 
 def build_smirks(reactants: list[str], products: list[str]) -> str:
@@ -84,7 +91,7 @@ def map_smirks(unmapped_smirks: str) -> str:
         >>> mapped.count(">>")  # Should still have the reaction arrow
         1
     """
-    rxn_mapper = RXNMapper()
+    rxn_mapper = _get_rxn_mapper()
 
     # run rxn_mapper
     results = rxn_mapper.get_attention_guided_atom_maps([unmapped_smirks])
